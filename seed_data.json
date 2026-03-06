@@ -1,0 +1,74 @@
+{
+  "metadata": {
+    "source_kind": "PrivHound_Seed"
+  },
+  "graph": {
+    "nodes": [
+      {
+        "id": "PRIVHOUND_SEED_IGNOREME",
+        "kinds": [
+          "PHUser", "PHPrivTarget", "PHEndpoint", "PHService", "PHUnquotedPath",
+          "PHWritablePath", "PHRegistryMisconfig", "PHTokenPrivilege", "PHScheduledTask",
+          "PHAutoRun", "PHWritableRegKey", "PHStoredCredential", "PHGPPPassword",
+          "PHUnattendFile", "PHPSHistory", "PHSensitiveFile", "PHUACBypass",
+          "PHWritableProgramDir", "PHLocalUser", "PHUserProfile",
+          "PHJITAdminTool", "PHPrintSpooler", "PHWSUSConfig", "PHSCCMCredential",
+          "PHCOMHijack", "PHNamedPipe", "PHCachedCreds", "PHWMISubscription",
+          "PHWebClientRelay"
+        ],
+        "properties": {
+          "objectid": "PRIVHOUND_SEED_IGNOREME",
+          "name": "PRIVHOUND_SEED_IGNOREME",
+          "description": "Seed node to pre-register all PrivHound edge kinds in BloodHound. Safe to delete."
+        }
+      }
+    ],
+    "edges": [
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanModifyService" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanWriteBinary" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanHijackPath" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanWriteTo" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHDLLHijackTo" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanExploit" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHHasPrivilege" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanEscalateTo" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanWriteTaskBinary" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanWriteAutorun" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanModifyRegKey" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHHasStoredCreds" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanReadCreds" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHRunsAs" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHEscalatesTo" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHExecutesAs" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHHosts" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHHasSessionOn" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanDecryptGPP" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanReadHistory" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanAccessFile" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanBypassUAC" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanWriteProgDir" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanLoginAs" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHMemberOf" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHHostsBinaryFor" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHRunsAsUser" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanReadProtected" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanExtractHashes" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanWriteProtected" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanInjectInto" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanLoginViaRunas" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanAccessProfile" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHProfileContains" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHContainsCreds" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanRequestJIT" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHGrantsTempAdmin" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanExploitSpooler" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanExploitWSUS" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanReadNAA" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanHijackCOM" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanImpersonatePipe" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHHasCachedCreds" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanModifyWMI" },
+      { "start": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "end": { "match_by": "id", "value": "PRIVHOUND_SEED_IGNOREME" }, "kind": "PHCanRelayWebClient" }
+    ]
+  }
+}

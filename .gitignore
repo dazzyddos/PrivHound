@@ -1,0 +1,12 @@
+# PrivHound scan output (not the custom nodes definition)
+privhound_*_*.json
+
+# Claude Code
+.claude/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# PowerShell
+*.ps1xml
