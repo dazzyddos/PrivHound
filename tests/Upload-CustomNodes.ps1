@@ -72,7 +72,7 @@ $body = Get-Content $JsonPath -Raw -Encoding UTF8
 try {
     Invoke-RestMethod $baseApi -Method POST -WebSession $session `
         -ContentType "application/json" -Body $body | Out-Null
-    $count = ((ConvertFrom-Json $body).custom_types.PSObject.Properties).Count
+    $count = ((ConvertFrom-Json $body).custom_types.PSObject.Properties | ForEach-Object { $_.Value }).Count
     Write-Host "  [+] Successfully registered $count custom node type(s)!" -ForegroundColor Green
     Write-Host "  [i] Hard-refresh your browser (Ctrl+Shift+R) to see the icons.`n" -ForegroundColor Cyan
 } catch {

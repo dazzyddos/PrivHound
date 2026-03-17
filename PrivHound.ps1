@@ -2598,7 +2598,7 @@ function Export-CustomNodeIcons([string]$OutDir=".") {
         $customTypes[$kind] = $kinds[$kind]
     }
     $apiPayload = @{ custom_types = $customTypes }
-    $combinedFile = Join-Path $OutDir "privhound_customnodes.json"
+    $combinedFile = Join-Path $(Get-Item $OutDir).FullName "privhound_customnodes.json"
     $json = $apiPayload | ConvertTo-Json -Depth 5
     [System.IO.File]::WriteAllText($combinedFile, $json, [System.Text.UTF8Encoding]::new($false))
     return $combinedFile
@@ -2622,7 +2622,7 @@ function Export-OpenGraphJson([string]$Path) {
             }
         }
     }
-    Write-Host "`n  Output: $Path" -ForegroundColor Green
+    Write-Host "`n  Output: $resolvedPath" -ForegroundColor Green
     Write-Host "  Upload: Administration -> File Ingest" -ForegroundColor Cyan
     Write-Host "  Icons:  POST privhound_customnodes.json to /api/v2/custom-nodes" -ForegroundColor Cyan
     Write-Host "  Query:  Explore -> Cypher tab (pathfinding UI not supported for custom nodes yet)`n" -ForegroundColor Yellow
