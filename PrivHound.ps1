@@ -704,6 +704,8 @@ function Check-WeakServicePermissions {
     $count = 0
     $svcs = Get-CachedServices | Where-Object { $_.PathName }
     $localUsers = $null
+    $modRegex = "\(A;;[A-Z]*?(CC|WD|DC|WO|GA|GW)[A-Z]*?;;;(BU|AU|WD|IU)\)" 
+    $sidRegex = "\(A;;[A-Z]*?(CC|WD|DC|WO|GA|GW)[A-Z]*?;;;$([regex]::Escape($currentSid))\)"
     foreach ($svc in $svcs) {
         # Check if current user can modify service config via SDDL
         $canModify = $false
@@ -711,9 +713,8 @@ function Check-WeakServicePermissions {
             $sd = sc.exe sdshow $svc.Name 2>$null
             if ($sd) { $Script:CachedServiceSDDL[$svc.Name] = $sd }
             $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-            if ($sd -match "\(A;;[A-Z]*?(WP|DC|WD|CC)[A-Z]*?;;;(BU|AU|WD|IU)\)" -or
-                ($currentSid -and $sd -match "\(A;;[A-Z]*?(WP|DC|WD|CC)[A-Z]*?;;;$([regex]::Escape($currentSid))\)")) {
-                $canModify = $true
+            if ($sd -match $modRegex -or ($currentSid -and $sd -match $sidRegex)) {
+            $canModify = $true
             }
         } catch {}
 
