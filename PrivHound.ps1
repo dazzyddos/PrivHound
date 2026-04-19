@@ -25,7 +25,7 @@ param(
     [switch]$NoCredTest
 )
 
-$Script:VERSION = "1.4.0"
+$Script:VERSION = "1.4.1"
 $Script:HOSTNAME = $env:COMPUTERNAME.ToUpper()
 if (-not $OutputPath) { $OutputPath = ".\privhound_$($Script:HOSTNAME)_$(Get-Date -Format yyyyMMdd_HHmmss).json" }
 
@@ -704,15 +704,91 @@ function Check-WeakServicePermissions {
     $count = 0
     $svcs = Get-CachedServices | Where-Object { $_.PathName }
     $localUsers = $null
+
+    $dangerousRights = @('DC','WP','WD','WO','SD')
+
+    # Well-known alias -> SID mappings for resolution
+    $wellKnownSids = @{
+        'SY' = 'S-1-5-18'     # SYSTEM — local system account, highest local privilege
+        'BA' = 'S-1-5-32-544' # Builtin\Administrators — local admin group
+        'BU' = 'S-1-5-32-545' # Builtin\Users — all local users, low privilege
+        'IU' = 'S-1-5-4'      # Interactive Users — any user logged on locally/RDP
+        'AU' = 'S-1-5-11'     # Authenticated Users — any successfully authed account (local or domain), excludes Anonymous
+        'WD' = 'S-1-1-0'      # Everyone — all users including Anonymous (pre-Vista behaviour); post-Vista excludes Anonymous in most contexts
+        'SU' = 'S-1-5-6'      # Service — any account running as a service
+        'NS' = 'S-1-5-20'     # Network Service — low-privilege service account with network credentials
+        'LS' = 'S-1-5-19'     # Local Service — low-privilege service account, no network credentials
+    }
+
+    # Principals we flag unconditionally (unprivileged groups)
+    $flaggedAliases = @('BU','AU','WD','IU')
+    $flaggedSids    = $flaggedAliases | ForEach-Object { $wellKnownSids[$_] }
+
+    # Add the current user's SID and all their group SIDs
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $currentUserSids = @($currentIdentity.User.Value) +  @($currentIdentity.Groups | ForEach-Object { $_.Value })
+
+    $allFlaggedSids = ($flaggedSids + $currentUserSids) | Sort-Object -Unique
+
+    function Resolve-AcePrincipal {
+        param([string]$Principal)
+        if ($wellKnownSids.ContainsKey($Principal)) {
+            return $wellKnownSids[$Principal]
+        }
+        # Already a raw SID
+        if ($Principal -match '^S-\d-') {
+            return $Principal
+        }
+        # Try NTAccount resolution for domain SIDs / group names
+        try {
+            $account = New-Object Security.Principal.NTAccount($Principal)
+            return $account.Translate([Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            return $null
+        }
+    }
+
+    function Parse-ServiceSddl {
+        param([string]$Sddl)
+
+        $acePattern = '\((?<type>[A-Z]+);(?<flags>[A-Z]*);(?<rights>[A-Z]*);[^;]*;[^;]*;(?<principal>[^)]+)\)'
+
+        [regex]::Matches($Sddl, $acePattern) | ForEach-Object {
+            $type      = $_.Groups['type'].Value
+            $flags     = $_.Groups['flags'].Value
+            $rightsRaw = $_.Groups['rights'].Value
+            $principal = $_.Groups['principal'].Value
+
+            # Only process allow ACEs
+            if ($type -ne 'A') { return }
+
+            # Split rights string into 2-char tokens
+            $rights = $rightsRaw -split '(?<=\G.{2})' | Where-Object { $_ -ne '' }
+
+            $matched = $rights | Where-Object { $_ -in $dangerousRights }
+            if (-not $matched) { return }
+
+            $resolvedSid = Resolve-AcePrincipal -Principal $principal
+            if ($resolvedSid -notin $allFlaggedSids) { return }
+
+            [PSCustomObject]@{
+                ACE            = $_.Value
+                Principal      = $principal
+                ResolvedSid    = $resolvedSid
+                DangerousRights = $matched -join ','
+                AllRights      = $rights -join ','
+                IsCurrentUser  = $resolvedSid -in $currentUserSids
+            }
+        }
+    }
+
     foreach ($svc in $svcs) {
         # Check if current user can modify service config via SDDL
         $canModify = $false
         try {
             $sd = sc.exe sdshow $svc.Name 2>$null
             if ($sd) { $Script:CachedServiceSDDL[$svc.Name] = $sd }
-            $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-            if ($sd -match "\(A;;[A-Z]*?(WP|DC|WD|CC)[A-Z]*?;;;(BU|AU|WD|IU)\)" -or
-                ($currentSid -and $sd -match "\(A;;[A-Z]*?(WP|DC|WD|CC)[A-Z]*?;;;$([regex]::Escape($currentSid))\)")) {
+            if (Parse-ServiceSddl -Sddl $sd) {
                 $canModify = $true
             }
         } catch {}
