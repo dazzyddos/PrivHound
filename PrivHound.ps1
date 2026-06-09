@@ -705,7 +705,13 @@ function Check-WeakServicePermissions {
     $svcs = Get-CachedServices | Where-Object { $_.PathName }
     $localUsers = $null
 
-    $dangerousRights = @('DC','WP','WD','WO','SD')
+    $dangerousRights = @(
+        'DC',
+        'WD',
+        'WO',
+        'GA',
+        'SD'
+    )
 
     # Well-known alias -> SID mappings for resolution
     $wellKnownSids = @{
