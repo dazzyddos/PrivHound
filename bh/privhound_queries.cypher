@@ -1,6 +1,6 @@
 # PrivHound - Prebuilt Cypher Queries for BloodHound
-# Import these as custom searches in BloodHound UI
-# Navigate to: Explore → Cypher tab → paste and run
+# Import these as saved queries with: python .\bh\bh_upload.py --register-query
+# Or run them individually from Explore → Cypher in BloodHound.
 #
 # NOTE: BloodHound CE's Cypher engine may not support property access
 # (e.g., n.property_name) on OpenGraph custom nodes. If a "Table View"
@@ -21,7 +21,7 @@ WHERE t.account = "BUILTIN\\Administrators"
 RETURN p
 
 ## Full PrivHound graph (all nodes and edges)
-MATCH p=()-[:PHCanModifyService|PHCanWriteBinary|PHCanHijackPath|PHCanWriteTo|PHDLLHijackTo|PHCanExploit|PHHasPrivilege|PHCanEscalateTo|PHCanWriteTaskBinary|PHCanWriteAutorun|PHCanModifyRegKey|PHCanReadCreds|PHHasStoredCreds|PHCanDecryptGPP|PHCanReadHistory|PHCanAccessFile|PHCanBypassUAC|PHCanWriteProgDir|PHCanLoginAs|PHMemberOf|PHHostsBinaryFor|PHRunsAsUser|PHRunsAs|PHEscalatesTo|PHExecutesAs|PHHosts|PHHasSessionOn|PHCanReadProtected|PHCanExtractHashes|PHCanWriteProtected|PHCanInjectInto|PHCanLoginViaRunas|PHCanAccessProfile|PHProfileContains|PHContainsCreds|PHCanRequestJIT|PHGrantsTempAdmin|PHCanExploitSpooler|PHCanExploitWSUS|PHCanReadNAA|PHCanHijackCOM|PHCanImpersonatePipe|PHHasCachedCreds|PHCanModifyWMI|PHCanRelayWebClient|PHCanWriteRecoveryBin|PHCanAccessShadowCopy|PHContainsSensitiveFile]->()
+MATCH p=()-[r]->() WHERE type(r) STARTS WITH "PH"
 RETURN p
 
 # ─────────────────────────────────────────────────
@@ -60,13 +60,13 @@ RETURN p
 # DLL HIJACKING
 # ─────────────────────────────────────────────────
 
-## Writable PATH directories (DLL hijack)
-MATCH p=(u:PHUser)-[:PHCanWriteTo]->(d:PHWritablePath)-[:PHDLLHijackTo]->(t:PHPrivTarget)
+## Writable PATH directories (inspect scope; privileged DLL loading unverified)
+MATCH p=(u:PHUser)-[:PHCanWriteTo]->(d:PHWritablePath)
 RETURN p
 
 ## List writable PATH dirs
 MATCH p=(u:PHUser)-[:PHCanWriteTo]->(d:PHWritablePath)
-RETURN p
+RETURN d
 
 # ─────────────────────────────────────────────────
 # TOKEN PRIVILEGES
@@ -113,7 +113,7 @@ MATCH p=(u:PHUser)-[:PHCanWriteTaskBinary]->(task:PHScheduledTask)-[:PHRunsAs]->
 RETURN p
 
 ## Writable autorun executables
-MATCH p=(u:PHUser)-[:PHCanWriteAutorun]->(ar:PHAutoRun)-[:PHExecutesAs]->()
+MATCH p=(u:PHUser)-[:PHCanWriteAutorun]->(ar:PHAutoRun)
 RETURN p
 
 # ─────────────────────────────────────────────────
@@ -124,8 +124,8 @@ RETURN p
 MATCH p=(u:PHUser)-[:PHHasStoredCreds|PHCanReadCreds]->(c:PHStoredCredential)
 RETURN p
 
-## cmdkey → runas /savecred → local user → admin
-MATCH p=(u:PHUser)-[:PHHasStoredCreds]->(c:PHStoredCredential)-[:PHCanLoginViaRunas]->(lu:PHLocalUser)-[:PHMemberOf]->(t:PHPrivTarget)
+## cmdkey entries (runas reuse unverified)
+MATCH p=(u:PHUser)-[r:PHHasStoredCreds]->(c:PHStoredCredential)
 RETURN p
 
 # ─────────────────────────────────────────────────
@@ -289,8 +289,8 @@ RETURN p
 # PRINT SPOOLER / PRINTNIGHTMARE
 # ─────────────────────────────────────────────────
 
-## Print Spooler exploitation → SYSTEM
-MATCH p=(u:PHUser)-[:PHCanExploitSpooler]->(ps:PHPrintSpooler)-[:PHEscalatesTo]->(t:PHPrivTarget)
+## Running Print Spooler (inspect weak_policy_observed; exploitability unverified)
+MATCH p=(u:PHUser)-[:PHObservedSpoolerPolicy]->(ps:PHPrintSpooler)
 RETURN p
 
 # ─────────────────────────────────────────────────
@@ -302,39 +302,31 @@ MATCH p=(u:PHUser)-[:PHCanExploitWSUS]->(ws:PHWSUSConfig)-[:PHEscalatesTo]->(t:P
 RETURN p
 
 # ─────────────────────────────────────────────────
-# SCCM/MECM NAA CREDENTIALS
+# SCCM/MECM CREDENTIAL SOURCES
 # ─────────────────────────────────────────────────
 
-## SCCM NAA → credential pipeline → admin
-MATCH p=(u:PHUser)-[:PHCanReadNAA]->(sccm:PHSCCMCredential)-[:PHContainsCreds]->(sccm)
+## SCCM credential-source observations (credentials unverified)
+MATCH p=(u:PHUser)-[:PHCanReadNAA]->(sccm:PHSCCMCredential)
 RETURN p
 
-## SCCM NAA → login → admin (full chain)
-MATCH p=(u:PHUser)-[:PHCanReadNAA]->(sccm:PHSCCMCredential)-[:PHCanLoginAs]->(lu:PHLocalUser)-[:PHMemberOf]->(t:PHPrivTarget)
-RETURN p
+## List SCCM credential-source nodes
+MATCH (u:PHUser)-[:PHCanReadNAA]->(sccm:PHSCCMCredential)
+RETURN sccm
 
 # ─────────────────────────────────────────────────
 # COM OBJECT HIJACKING
 # ─────────────────────────────────────────────────
 
-## COM hijack → privileged execution
-MATCH p=(u:PHUser)-[:PHCanHijackCOM]->(com:PHCOMHijack)-[:PHExecutesAs]->(t:PHPrivTarget)
-RETURN p
-
-## List hijackable COM objects
-MATCH p=(u:PHUser)-[:PHCanHijackCOM]->(com:PHCOMHijack)
+## COM per-user override candidates (privileged activation unverified)
+MATCH p=(u:PHUser)-[:PHCanOverrideCOM]->(com:PHCOMHijack)
 RETURN p
 
 # ─────────────────────────────────────────────────
 # NAMED PIPE PERMISSIONS
 # ─────────────────────────────────────────────────
 
-## Named pipe impersonation → SYSTEM
-MATCH p=(u:PHUser)-[:PHCanImpersonatePipe]->(pipe:PHNamedPipe)-[:PHRunsAs]->(t:PHPrivTarget)
-RETURN p
-
-## List accessible SYSTEM pipes
-MATCH p=(u:PHUser)-[:PHCanImpersonatePipe]->(pipe:PHNamedPipe)
+## Accessible named pipe candidates (impersonation unverified)
+MATCH p=(u:PHUser)-[:PHCanConnectPipe]->(pipe:PHNamedPipe)
 RETURN p
 
 # ─────────────────────────────────────────────────
@@ -343,6 +335,10 @@ RETURN p
 
 ## Cached credential sources
 MATCH p=(u:PHUser)-[:PHHasCachedCreds]->(cc:PHCachedCreds)
+RETURN p
+
+## Cached domain logon policy (can exist on workgroup hosts; cached credentials unverified)
+MATCH p=(u:PHUser)-[:PHCachedLogonsConfigured]->(cc:PHCachedCreds)
 RETURN p
 
 ## Cached creds with embedded passwords → login → admin
@@ -407,7 +403,7 @@ RETURN p
 
 ## Any credential source → login → admin (unified)
 MATCH p=(u:PHUser)-[*1..7]->(t:PHPrivTarget)
-WHERE any(r IN relationships(p) WHERE type(r) IN ["PHCanLoginAs","PHCanLoginViaRunas"])
+WHERE any(r IN relationships(p) WHERE type(r) = "PHCanLoginAs")
 RETURN p
 
 ## Combined: all shortest paths to SYSTEM or Admin

@@ -22,7 +22,7 @@ If Active Directory attacks can be thought of as a graph, why not local privileg
 
 ## The Solution
 
-PrivHound changes this by modeling local privilege escalation as a graph. Built on BloodHound's OpenGraph framework, it enumerates **29 categories** of Windows privilege escalation vectors, from weak service permissions to COM hijacking to WebClient relay and outputs them as interconnected nodes and edges.
+PrivHound models local privilege escalation as a graph. Built on BloodHound's OpenGraph framework, **29 checks cover the 30 techniques** listed below, from weak service permissions to COM hijacking and WebClient relay, and represent findings as connected nodes and edges.
 
 The result: multi-hop escalation chains become **visible**, **queryable with Cypher**, and **overlayable on top of existing Active Directory attack paths**.
 
@@ -56,20 +56,20 @@ CurrentUser ─PHCanAccessProfile─→ OtherUser's Profile
 | 12 | **Unattended Install Files** | Credentials in unattend/sysprep XML | T1552.001 |
 | 13 | **PowerShell History** | PSReadLine history and transcripts | T1552.001 |
 | 14 | **Sensitive Files** | SAM backups, .kdbx, .rdg, git-credentials | T1552.001 |
-| 15 | **UAC Bypass Opportunities** | UAC misconfig or admin-not-elevated | T1548.002 |
+| 15 | **UAC Policy Observations** | UAC policy state; bypass exploitability is unverified | T1548.002 |
 | 16 | **Writable Program Directories** | Writable dirs in Program Files | T1574.010 |
 | 17 | **Cross-User Profiles** | Readable profiles with sensitive files | T1552.001 |
 | 18 | **Credential Login Paths** | Validate extracted creds against local users | T1078.003 |
 | 19 | **Cross-User Privilege Escalation** | Analyze what discovered users can access | T1078.003 |
 | 20 | **JIT Admin Tools** | MakeMeAdmin, CyberArk EPM, Admin By Request | T1548 |
-| 21 | **Print Spooler / PrintNightmare** | Vulnerable Point and Print configuration | T1068 |
-| 22 | **WSUS HTTP (non-SSL)** | WSUS MITM for SYSTEM code execution | T1557 |
-| 23 | **SCCM/MECM NAA Credentials** | Network Access Account DPAPI extraction | T1552.001 |
-| 24 | **COM Object Hijacking** | HKCU CLSID hijack for SYSTEM-context DLL load | T1546.015 |
-| 25 | **Named Pipe Permissions** | Permissive SYSTEM pipe ACLs → impersonation | T1134.001 |
-| 26 | **Cached Credentials** | DCC2, WiFi, WinSCP, FileZilla, PuTTY creds | T1552.001 |
+| 21 | **Print Spooler Policy** | Running service and explicitly weakened Point and Print policy; patch/exploitability unverified | T1068 |
+| 22 | **WSUS HTTP (non-SSL)** | HTTP WSUS configuration; MITM prerequisites and impact require verification | T1557 |
+| 23 | **SCCM/MECM Credential Sources** | NAA and task-sequence discovery; credential extraction is unverified | T1552.001 |
+| 24 | **COM Override Candidates** | System COM registrations without an HKCU override; privileged activation unverified | T1546.015 |
+| 25 | **Named Pipe Connectivity** | Connection checks; server identity and impersonation are unverified | T1134.001 |
+| 26 | **Cached Credential Sources** | Cached-logon policy, WiFi, WinSCP, FileZilla, and PuTTY stores | T1552.001 |
 | 27 | **WMI Event Subscriptions** | Writable WMI consumer binaries/scripts | T1546.003 |
-| 28 | **WebClient Relay** | NTLM relay via WebClient to DC LDAP → SYSTEM | T1187 |
+| 28 | **WebClient Relay Surface** | WebClient and LDAP policy prerequisites; relay/exploitability unverified | T1187 |
 | 29 | **Service Recovery Commands** | Writable failure recovery command binaries | T1574.010 |
 | 30 | **Shadow Copy Sensitive Files** | SAM/SYSTEM hives accessible in VSS snapshots | T1003.002 |
 
@@ -86,12 +86,12 @@ This is what separates PrivHound from traditional privesc tools. Instead of list
 | **Cross-user profile** | `User → Profile → SensitiveFile → PHCanLoginAs → LocalUser → Admin` |
 | **Cross-user escalation** | `User → (creds) → PHCanLoginAs → UserX → PHCanWriteBinary → Service → SYSTEM` |
 | **SeBackup sub-chain** | `User → SeBackup → PHCanReadProtected → SAM → PHCanExtractHashes → Admin` |
-| **Stored creds → runas** | `User → StoredCred → PHCanLoginViaRunas → LocalUser → Admin` |
-| **SCCM NAA → creds** | `User → SCCMCred → PHContainsCreds → PHCanLoginAs → Admin` |
-| **WebClient relay** | `User → WebClientRelay → PHEscalatesTo → SYSTEM` |
-| **COM hijack** | `User → COMHijack → PHExecutesAs → SYSTEM` |
+| **Stored cmdkey entries** | `User → PHHasStoredCreds → StoredCred` (runas reuse unverified) |
+| **SCCM NAA source** | `User → PHCanReadNAA → PHSCCMCredential` (credential extraction unverified) |
+| **WebClient relay surface** | `User → WebClientRelay → PHEscalatesTo → SYSTEM` (relay prerequisites require verification) |
+| **COM override candidate** | `User → PHCanOverrideCOM → COM candidate` (privileged activation unverified) |
 | **WMI subscription** | `User → WMISubscription → PHRunsAs → SYSTEM` |
-| **Named pipe** | `User → NamedPipe → PHRunsAs → SYSTEM` |
+| **Named pipe candidate** | `User → PHCanConnectPipe → Pipe` (impersonation unverified) |
 | **Service recovery** | `User → PHCanWriteRecoveryBin → Service → SYSTEM` |
 | **Shadow copy hashes** | `User → ShadowCopy → SAM → PHCanExtractHashes → Admin` |
 | **JIT admin** | `User → MakeMeAdmin → PHGrantsTempAdmin → Admin` |
@@ -105,8 +105,8 @@ When PrivHound discovers valid credentials for other local users (via GPP passwo
 **How it works (no SeImpersonatePrivilege required):**
 
 1. `LogonUser` obtains a token handle for each discovered user
-2. `GetTokenInformation` extracts group memberships (SIDs) and token privileges
-3. ACL checks run using the discovered user's groups — not the current user's
+2. `GetTokenInformation` extracts token privileges
+3. Windows access checks evaluate file and service ACLs against the discovered user's token
 4. Edges are created from the discovered user's node to any vulnerable resources they can access
 5. The token is closed — no impersonation occurs, no elevated privileges needed
 
@@ -144,6 +144,9 @@ All cross-user edges include a `discovered_via="credential"` property for filter
 
 # Skip credential validation (no logon attempts)
 .\PrivHound.ps1 -NoCredTest
+
+# Optional findings report alongside the graph JSON
+.\PrivHound.ps1 -FindingsPath .\privhound_findings.json
 ```
 
 ### 2. Register custom node icons (once per BH instance)
@@ -156,31 +159,34 @@ Custom icons give your nodes distinct visuals instead of the default "?" icon.
 # → Outputs privhound_customnodes.json
 
 # Upload to BloodHound CE
-.\tests\Upload-CustomNodes.ps1 -Token "<JWT_TOKEN>"
+.\bh\Upload-CustomNodes.ps1 -Token "<JWT_TOKEN>"
+
+# Or use the Python uploader and credentials from .env (copy .env.example first)
+python .\bh\bh_upload.py --register-node .\privhound_customnodes.json
 
 # Or with a remote BH instance
-.\tests\Upload-CustomNodes.ps1 -BHUrl "http://192.168.1.50:8080" -Token "<JWT_TOKEN>"
+.\bh\Upload-CustomNodes.ps1 -BHUrl "http://192.168.1.50:8080" -Token "<JWT_TOKEN>"
 ```
-
-<details>
-<summary>Manual upload via curl</summary>
-
-```bash
-curl -X POST http://localhost:8080/api/v2/custom-nodes \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -H "Prefer: wait=30" \
-  -d @privhound_customnodes.json
-```
-
-If you get a **409 Conflict** (types already exist), use `Upload-CustomNodes.ps1` which handles deletion and re-creation automatically.
-</details>
 
 ### 3. Upload OpenGraph data to BloodHound
 
-- Navigate to **Administration → File Ingest**
-- Drag and drop `privhound_<HOSTNAME>_<timestamp>.json`
-- Wait for ingest to complete
+```powershell
+# Edit .env with BH_URL and BH_KEY/BH_ID (or BH_TOKEN)
+python .\bh\bh_upload.py --ingest .\privhound_<HOSTNAME>_<timestamp>.json
+
+# Upload a batch
+python .\bh\bh_upload.py --ingest .\privhound_*_*.json
+
+# Or upload an archive of collector JSONs (each graph is ingested separately)
+python .\bh\bh_upload.py --ingest .\privhound_all.zip
+
+# Optional: seed edge kinds before uploading collected graphs
+python .\bh\bh_upload.py --ingest .\bh\seed_data.json
+```
+
+Alternatively, navigate to **Administration → File Ingest**, drag and drop the JSON file, and wait for ingest to complete.
+The archive uploader skips non-OpenGraph JSON such as `privhound_customnodes.json`; register icons separately with `--register-node`.
+The seed graph creates a `PRIVHOUND_SEED_IGNOREME` node; remove it after the collected data has registered the edge kinds.
 
 ### 4. Query in BloodHound
 
@@ -203,7 +209,12 @@ WHERE any(r IN relationships(p) WHERE type(r) = "PHCanAccessProfile")
 RETURN p
 ```
 
-See [`queries/privhound_queries.cypher`](queries/privhound_queries.cypher) for 50+ prebuilt queries covering every attack path category.
+See [`bh/privhound_queries.cypher`](bh/privhound_queries.cypher) for 79 prebuilt queries covering the attack-path categories.
+Import them as saved Cypher queries with the Python uploader:
+
+```powershell
+python .\bh\bh_upload.py --register-query path\to\custom.cypher
+```
 
 ---
 
@@ -217,10 +228,12 @@ See [`queries/privhound_queries.cypher`](queries/privhound_queries.cypher) for 5
 
 ```powershell
 # On each host
-.\PrivHound.ps1 -OutputPath ".\privhound_$env:COMPUTERNAME.json"
+.\PrivHound.ps1
 
-# Collect all JSONs and upload together
-Compress-Archive -Path .\privhound_*.json -DestinationPath privhound_all.zip
+# Collect the timestamped output JSONs and upload the archive
+Compress-Archive -Path .\privhound_*_*.json -DestinationPath privhound_all.zip
+
+python .\bh\bh_upload.py --ingest .\privhound_all.zip
 ```
 
 Each endpoint gets its own set of nodes (IDs are hostname-scoped), so data from multiple hosts coexists cleanly in the same graph.
@@ -279,12 +292,12 @@ This reveals scenarios like: *"The intern's AD account has a session on SERVER01
 | `PHLocalUser` | A local user account | user (yellow) |
 | `PHUserProfile` | Another user's accessible profile | address-card (blue) |
 | `PHJITAdminTool` | JIT admin tool (MakeMeAdmin, etc.) | user-clock (orange) |
-| `PHPrintSpooler` | Print Spooler with vulnerable config | print (red) |
+| `PHPrintSpooler` | Running Print Spooler; policy and patch status require verification | print (red) |
 | `PHWSUSConfig` | WSUS configured over HTTP | download (red) |
 | `PHSCCMCredential` | SCCM/MECM NAA credential | server (red) |
-| `PHCOMHijack` | Hijackable COM object CLSID | puzzle-piece (purple) |
-| `PHNamedPipe` | Named pipe with permissive ACLs | faucet (orange) |
-| `PHCachedCreds` | Cached credential source | database (yellow) |
+| `PHCOMHijack` | COM per-user override candidate; privileged activation unverified | puzzle-piece (purple) |
+| `PHNamedPipe` | Connectable named pipe; impersonation unverified | faucet (orange) |
+| `PHCachedCreds` | Cached-logon policy or stored credential source; check properties for verification | database (yellow) |
 | `PHWMISubscription` | WMI subscription with writable consumer | bolt (purple) |
 | `PHWebClientRelay` | WebClient NTLM relay attack surface | share-nodes (red) |
 | `PHShadowCopy` | Volume Shadow Copy with sensitive files | hard-drive (gray) |
@@ -297,7 +310,7 @@ This reveals scenarios like: *"The intern's AD account has a session on SERVER01
 | `PHCanWriteBinary` | User can overwrite the service binary |
 | `PHCanHijackPath` | User can exploit unquoted path |
 | `PHCanWriteTo` | User can write to a PATH directory |
-| `PHDLLHijackTo` | Writable PATH enables DLL hijack to SYSTEM |
+| `PHDLLHijackTo` | Writable PATH enables DLL hijack to SYSTEM (requires verified load; legacy edge) |
 | `PHCanExploit` | User can exploit a misconfiguration |
 | `PHHasPrivilege` | User holds a dangerous token privilege |
 | `PHCanEscalateTo` | Privilege enables escalation to target |
@@ -312,22 +325,23 @@ This reveals scenarios like: *"The intern's AD account has a session on SERVER01
 | `PHCanBypassUAC` | User can bypass UAC |
 | `PHCanWriteProgDir` | User can write to a Program Files dir |
 | `PHCanLoginAs` | Recovered credentials are valid for a local user |
-| `PHCanLoginViaRunas` | Stored cred enables runas /savecred |
+| `PHCanLoginViaRunas` | Verified runas /savecred access (legacy edge; cmdkey entries alone are unverified) |
 | `PHCanAccessProfile` | User can read another user's profile |
 | `PHCanRequestJIT` | User can request JIT admin elevation |
-| `PHCanExploitSpooler` | Spooler vulnerable to PrintNightmare |
+| `PHObservedSpoolerPolicy` | Running Print Spooler; `weak_policy_observed` distinguishes explicitly weakened policy |
 | `PHCanExploitWSUS` | WSUS over HTTP enables MITM |
-| `PHCanReadNAA` | SCCM NAA credentials are extractable |
-| `PHCanHijackCOM` | COM CLSID can be hijacked via HKCU |
-| `PHCanImpersonatePipe` | Named pipe allows token impersonation |
+| `PHCanReadNAA` | SCCM NAA/task-sequence source observed; credentials unverified |
+| `PHCanOverrideCOM` | HKCU COM override candidate; privileged activation unverified |
+| `PHCanConnectPipe` | Named pipe connection succeeded; impersonation unverified |
 | `PHHasCachedCreds` | Cached credentials are accessible |
+| `PHCachedLogonsConfigured` | Cached logon policy configured; credential presence unverified (also reported on workgroup machines) |
 | `PHCanModifyWMI` | WMI consumer binary/script is writable |
 | `PHCanRelayWebClient` | WebClient enables NTLM relay to DC LDAP |
 | `PHCanWriteRecoveryBin` | User can replace service recovery binary |
 | `PHCanAccessShadowCopy` | User can access shadow copy sensitive files |
 | `PHRunsAs` | Service/task runs as SYSTEM |
 | `PHEscalatesTo` | Misconfiguration escalates to target |
-| `PHExecutesAs` | Autorun/COM executes in a privileged context |
+| `PHExecutesAs` | Legacy edge; no longer emitted for unverified autorun execution |
 | `PHHostsBinaryFor` | Writable dir hosts a service/task binary |
 | `PHRunsAsUser` | Service runs as a named local user |
 | `PHMemberOf` | Local user is a member of Administrators |
@@ -349,6 +363,8 @@ This reveals scenarios like: *"The intern's AD account has a session on SERVER01
 - **Target:** Windows PowerShell 5.1+ or PowerShell 7+
 - **Privileges:** Standard user (most checks). Some checks benefit from local admin.
 - **BloodHound:** CE v8.0.0+ with PostgreSQL backend, or BloodHound Enterprise
+- **Python uploader:** Python 3.10+; uses only the standard library.
+- **Optional seeding:** `bh\seed_data.json` adds a disposable seed node to pre-register edge kinds.
 
 ---
 
@@ -356,14 +372,15 @@ This reveals scenarios like: *"The intern's AD account has a session on SERVER01
 
 ```
 PrivHound/
-├── PrivHound.ps1                      # Main collector script
-├── privhound_customnodes.json         # Custom node icons for BloodHound UI
-├── queries/
-│   └── privhound_queries.cypher       # 50+ prebuilt Cypher queries
-├── tests/
+├── PrivHound.ps1                     # Main collector script
+├── bh/
+│   ├── bh_upload.py                  # Ingest data, register icons, import saved queries
+│   ├── Upload-CustomNodes.ps1        # PowerShell custom-node icon uploader
+│   ├── privhound_queries.cypher      # 79 prebuilt Cypher queries
+│   └── seed_data.json                # Optional edge-kind seed graph
+├── lab/
 │   ├── Setup-VulnLab.ps1             # Create vulnerable lab environment
-│   ├── Teardown-VulnLab.ps1          # Clean up lab artifacts
-│   └── Upload-CustomNodes.ps1        # Upload custom node icons to BH CE
+│   └── Teardown-VulnLab.ps1          # Clean up lab artifacts
 └── README.md
 ```
 
@@ -386,7 +403,6 @@ function Check-NewVector {
     $nodeId = New-PHId "newtype" "unique-name"
     Add-PHNode -Id $nodeId -Kinds @("PHNewType") -Properties @{
         name     = "Finding@$Script:HOSTNAME"
-        objectid = $nodeId
         hostname = $Script:HOSTNAME
     }
     Add-PHEdge -StartId $Script:CurrentUserId -EndId $nodeId -Kind "PHCanExploitNew"

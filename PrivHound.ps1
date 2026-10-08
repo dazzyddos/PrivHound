@@ -1,16 +1,21 @@
 <#
 .SYNOPSIS
-    PrivHound v1.4.0 - Windows Local PrivEsc Collector for BloodHound OpenGraph
+    PrivHound v1.5.0 - Windows Local PrivEsc Collector for BloodHound OpenGraph
 .DESCRIPTION
     Enumerates local privilege escalation vectors and outputs BloodHound OpenGraph JSON.
 .PARAMETER OutputPath
     Output JSON path. Default: .\privhound_<hostname>_<timestamp>.json
+.PARAMETER FindingsPath
+    Optional JSON report containing every finding, including severity and abuse information.
 .PARAMETER OutputFormat
     BloodHound | BloodHound-customnodes | All (default: All)
 .PARAMETER SkipChecks
-    Checks to skip: Services, UnquotedPaths, DLLHijacking, AlwaysInstall, TokenPrivileges, ScheduledTasks, Autoruns, RegistryKeys, StoredCreds, GPPPasswords, UnattendFiles, PSHistory, SensitiveFiles, UACBypass, WritableProgDirs, CrossUserProfiles, CredLoginPaths, CrossUserPriv, JITAdmin, PrintSpooler, WSUSConfig, SCCMCreds, COMHijacking, NamedPipes, CachedCreds, WMISubscriptions, WebClientRelay, SvcRecovery, ShadowCopies
+    Check names to skip (for example, Services, StoredCreds, or NamedPipes).
+    See the $checks array in Invoke-PrivHound for the full list.
 .PARAMETER NoCredTest
     Skip credential validation (Test-LocalCredential). No PHCanLoginAs edges will be created.
+.PARAMETER Verbose
+    Show per-check progress and finding counts during collection.
 .EXAMPLE
     .\PrivHound.ps1
     .\PrivHound.ps1 -OutputFormat BloodHound-customnodes
@@ -19,13 +24,14 @@
 [CmdletBinding()]
 param(
     [string]$OutputPath = "",
+    [string]$FindingsPath = "",
     [ValidateSet('BloodHound','BloodHound-customnodes','All')]
     [string]$OutputFormat = "All",
     [string[]]$SkipChecks = @(),
     [switch]$NoCredTest
 )
 
-$Script:VERSION = "1.4.1"
+$Script:VERSION = "1.5.0"
 $Script:HOSTNAME = $env:COMPUTERNAME.ToUpper()
 if (-not $OutputPath) { $OutputPath = ".\privhound_$($Script:HOSTNAME)_$(Get-Date -Format yyyyMMdd_HHmmss).json" }
 
@@ -40,11 +46,18 @@ $Script:ValidatedCreds = [System.Collections.ArrayList]::new()
 $Script:CachedServiceSDDL = @{}
 $Script:CachedServiceRecovery = @{}
 $Script:NoCredTest = $NoCredTest.IsPresent
+$Script:ShowCheckDetails = $VerbosePreference -eq 'Continue'
 $Script:CachedServices = $null
 $Script:CachedLocalUsers = $null
+$Script:AclIdentity = $null
+$Script:AclIsAdmin = $false
 
 function Write-PHBanner { Write-Host "`n  PrivHound v$Script:VERSION - Windows PrivEsc -> BloodHound OpenGraph`n  Target: $Script:HOSTNAME | User: $env:USERDOMAIN\$env:USERNAME`n" -ForegroundColor Red }
-function Write-PHStatus($Message, $Type="info") { $c = switch($Type){"info"{"Cyan"}"finding"{"Green"}"warn"{"Yellow"}"error"{"Red"}}; Write-Host "  [$($Type[0])] $Message" -ForegroundColor $c }
+function Write-PHStatus($Message, $Type="info") {
+    if (-not $Script:ShowCheckDetails -and $Type -in @('info','finding')) { return }
+    $c = switch($Type){"info"{"Cyan"}"finding"{"Green"}"warn"{"Yellow"}"error"{"Red"}}
+    Write-Host "  [$($Type[0])] $Message" -ForegroundColor $c
+}
 
 function New-PHId([string]$Type,[string]$Name) {
     $h = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$Script:HOSTNAME|$Type|$Name"))).Replace("-","").Substring(0,32).ToUpper()
@@ -52,15 +65,14 @@ function New-PHId([string]$Type,[string]$Name) {
 }
 
 function Add-PHNode([string]$Id,[string[]]$Kinds,[hashtable]$Properties) {
-    if ($Script:NodeIds.ContainsKey($Id)) { return $Id }
+    if ($Script:NodeIds.ContainsKey($Id)) { return }
     $Script:NodeIds[$Id] = $true
     if ($Properties.ContainsKey("name")) { $Properties["name"] = $Properties["name"].ToUpper() }
-    $Properties["objectid"] = $Id
+    [void]$Properties.Remove('objectid')
     # Remove null values — OpenGraph schema rejects them
     $nullKeys = @($Properties.Keys | Where-Object { $null -eq $Properties[$_] })
-    foreach ($k in $nullKeys) { $Properties.Remove($k) }
+    foreach ($k in $nullKeys) { [void]$Properties.Remove($k) }
     [void]$Script:Nodes.Add(@{ id=$Id; kinds=$Kinds; properties=$Properties })
-    return $Id
 }
 
 $Script:EdgeAbuseInfo = @{
@@ -80,8 +92,8 @@ $Script:EdgeAbuseInfo = @{
         opsec       = "Dropping an exe in C:\Program Files is conspicuous. Clean up immediately after exploitation."
     }
     PHCanWriteTo = @{
-        description = "User can write to a directory in the system PATH. Privileged processes searching for DLLs will load a planted DLL from this directory."
-        abuse_info  = "Identify DLLs that a privileged service fails to load, then place a DLL with that name in the writable PATH directory. The service will load it on next start. See MITRE T1574.001."
+        description = "User can write to a directory in the current PATH. Check the scope property: a user PATH entry does not by itself affect privileged processes."
+        abuse_info  = "Check whether a privileged process searches for DLLs in this directory before treating it as an escalation path. See MITRE T1574.001."
         opsec       = "DLL side-loading is a known EDR detection vector. Use a proxy DLL with forwarded exports."
     }
     PHDLLHijackTo = @{
@@ -110,8 +122,8 @@ $Script:EdgeAbuseInfo = @{
         opsec       = "Task execution logged under Event ID 4698/4702 and TaskScheduler operational log."
     }
     PHCanWriteAutorun = @{
-        description = "User can replace an executable in an HKLM Run/RunOnce autorun key. It executes as the next user who logs in (often an admin)."
-        abuse_info  = "Back up the original autorun binary, replace it with an attacker-controlled executable, then wait for a privileged user to log in. See MITRE T1547.001."
+        description = "User can replace an autorun executable. HKCU entries normally execute only as the same user; the scope property distinguishes HKCU from HKLM."
+        abuse_info  = "Verify that a privileged user actually executes the binary before treating the autorun as an escalation path. See MITRE T1547.001."
         opsec       = "Requires waiting for a privileged user to log in. Replaced binary visible to autorun enumeration."
     }
     PHCanModifyRegKey = @{
@@ -120,8 +132,8 @@ $Script:EdgeAbuseInfo = @{
         opsec       = "Registry modification generates Event ID 4657. Restore original ImagePath immediately."
     }
     PHHasStoredCreds = @{
-        description = "Windows Credential Manager contains saved credentials. If /savecred was used, commands can be run as that user without a password."
-        abuse_info  = "Enumerate stored credentials with cmdkey /list. If /savecred entries exist, use runas /savecred /user:TARGET_USER to execute commands as that user. See MITRE T1555.004."
+        description = "Windows Credential Manager contains an entry; cmdkey output alone cannot establish runas reuse."
+        abuse_info  = "Inspect the credential target and type with cmdkey /list before assessing whether it can be reused. See MITRE T1555.004."
         opsec       = "runas /savecred creates Event ID 4648 (explicit credential logon) easily correlated to the caller."
     }
     PHCanReadCreds = @{
@@ -145,7 +157,7 @@ $Script:EdgeAbuseInfo = @{
         opsec       = "SAM/SYSTEM access is high-fidelity detection. Copy files to staging dir and process offline."
     }
     PHCanBypassUAC = @{
-        description = "User is admin but running non-elevated (filtered token), or UAC is misconfigured (ConsentPromptBehaviorAdmin=0). Auto-elevation bypass gives full admin without a prompt."
+        description = "UAC is disabled or configured not to prompt administrators. A filtered administrator token alone is normal behavior, not a confirmed bypass."
         abuse_info  = "Use an auto-elevation technique to spawn an elevated process without triggering a UAC prompt. Common methods involve abusing trusted Windows binaries that auto-elevate. See MITRE T1548.002."
         opsec       = "Registry-based UAC bypasses leave well-known IoCs. Clean up immediately after use."
     }
@@ -235,7 +247,7 @@ $Script:EdgeAbuseInfo = @{
         opsec       = "Requires network-level MITM. Injected updates appear in Windows Update history. WSUS server logs show the fake update."
     }
     PHCanReadNAA = @{
-        description = "SCCM/MECM Network Access Account (NAA) credentials are stored locally and may be retrievable via WMI or DPAPI."
+        description = "An SCCM/MECM NAA or task-sequence source was found in WMI; readable credentials were not verified."
         abuse_info  = "Query WMI namespace root\\ccm\\policy\\Machine\\ActualConfig for CCM_NetworkAccessAccount. Decrypt the DPAPI-protected blob using SharpSCCM or sccmhunter. NAA creds often have domain-wide access. See MITRE T1552.001."
         opsec       = "WMI queries to CCM namespace may be logged. Using recovered domain creds generates logon events."
     }
@@ -250,9 +262,29 @@ $Script:EdgeAbuseInfo = @{
         opsec       = "Named pipe impersonation generates ETW pipe events. Some EDR products monitor for suspicious pipe creation/connection patterns."
     }
     PHHasCachedCreds = @{
-        description = "Cached or stored credentials exist on this system: domain cached credentials (DCC2), WiFi passwords, WinSCP/FileZilla/PuTTY saved sessions."
-        abuse_info  = "DCC2: extract from SECURITY hive and crack offline (hashcat mode 2100). WiFi: netsh wlan show profile key=clear. WinSCP: decrypt from registry. FileZilla: read plaintext XML. See MITRE T1552.001."
+        description = "A WiFi password or WinSCP/FileZilla/PuTTY saved session was found."
+        abuse_info  = "WiFi: netsh wlan show profile key=clear. WinSCP: decrypt from registry. FileZilla: read plaintext XML. See MITRE T1552.001."
         opsec       = "Reading registry/files is low-noise. DCC2 cracking is offline. Using recovered creds generates logon events."
+    }
+    PHObservedSpoolerPolicy = @{
+        description = "Print Spooler is running; weak_policy_observed indicates whether an explicitly less-restrictive driver installation policy was found. Exploitability is unverified."
+        abuse_info  = "Review Point and Print policy and installed cumulative updates before investigating further."
+        opsec       = "Reading driver-install policy is low-noise; verify patch status before further testing."
+    }
+    PHCanOverrideCOM = @{
+        description = "A system-wide COM CLSID lacks an HKCU override. Privileged activation is not verified."
+        abuse_info  = "Verify whether a privileged process loads the CLSID using the caller's HKCU hive."
+        opsec       = "Registry inspection is low-noise; unexpected COM DLL loads may be monitored."
+    }
+    PHCanConnectPipe = @{
+        description = "A connection to this named pipe succeeded. Its server identity and impersonation behavior are unverified."
+        abuse_info  = "Inspect pipe ACL and server behavior before treating it as an impersonation path."
+        opsec       = "Pipe connection events may be monitored; no impersonation was verified."
+    }
+    PHCachedLogonsConfigured = @{
+        description = "CachedLogonsCount allows cached domain logons, including on a standalone system where it may be an unused default. Cache contents were not inspected."
+        abuse_info  = "Verify that domain logons were ever cached before investigating DCC2 hashes."
+        opsec       = "Reading the cached-logon policy is low-noise; credential use generates logon events."
     }
     PHCanModifyWMI = @{
         description = "A WMI permanent event subscription consumer's binary or script path is writable by the current user. WMI subscriptions execute as SYSTEM."
@@ -312,13 +344,15 @@ function Add-PHEdge([string]$StartId,[string]$EndId,[string]$Kind,[hashtable]$Pr
     $Script:EdgeIds[$edgeKey] = $true
     if ($Script:EdgeAbuseInfo.ContainsKey($Kind)) {
         $info = $Script:EdgeAbuseInfo[$Kind]
-        if (-not $Properties.ContainsKey("description"))  { $Properties["description"]  = $info.description }
-        if (-not $Properties.ContainsKey("abuse_info"))    { $Properties["abuse_info"]    = $info.abuse_info }
-        if (-not $Properties.ContainsKey("opsec"))         { $Properties["opsec"]         = $info.opsec }
+        foreach ($key in @('description','abuse_info','opsec')) {
+            if (-not $Properties.ContainsKey($key) -and $info.ContainsKey($key)) {
+                $Properties[$key] = $info[$key]
+            }
+        }
     }
     # Remove null values — OpenGraph schema rejects them
     $nullKeys = @($Properties.Keys | Where-Object { $null -eq $Properties[$_] })
-    foreach ($k in $nullKeys) { $Properties.Remove($k) }
+    foreach ($k in $nullKeys) { [void]$Properties.Remove($k) }
     $e = @{ start=@{match_by="id";value=$StartId}; end=@{match_by="id";value=$EndId}; kind=$Kind }
     $e["properties"] = $Properties
     [void]$Script:Edges.Add($e)
@@ -328,27 +362,146 @@ function Add-PHFinding([string]$Check,[string]$Severity,[string]$Description,[st
     [void]$Script:Findings.Add(@{Check=$Check;Severity=$Severity;Description=$Description;AbuseInfo=$AbuseInfo})
 }
 
-function Test-WritableAcl([string]$Path, [string[]]$Groups=$null) {
-    try {
-        if (-not (Test-Path $Path)) { return $false }
-        if ($null -eq $Groups) {
-            $Groups = @("Everyone","BUILTIN\\Users","Authenticated Users",$env:USERNAME)
-            try { $Groups += ([System.Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Translate([System.Security.Principal.NTAccount]).Value }) } catch {}
+function Initialize-AclAccessCheck {
+    if ('PrivHound.FileAccess' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+namespace PrivHound {
+    public static class FileAccess {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct GenericMapping {
+            public uint Read, Write, Execute, All;
         }
-        foreach ($ace in (Get-Acl $Path -EA SilentlyContinue).Access) {
-            if ($ace.AccessControlType -eq "Allow" -and
-                ($ace.FileSystemRights -match "Write|Modify|FullControl") -and
-                ($Groups | Where-Object { $ace.IdentityReference.Value -match [regex]::Escape($_) })) {
-                return $true
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool DuplicateToken(IntPtr token, int level, out IntPtr duplicate);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AccessCheck(byte[] descriptor, IntPtr token, uint desired,
+            ref GenericMapping mapping, IntPtr privileges, ref uint length,
+            out uint granted, out bool allowed);
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("advapi32.dll")]
+        private static extern void MapGenericMask(ref uint accessMask, ref GenericMapping mapping);
+        private static bool Check(byte[] descriptor, IntPtr token, uint desired, GenericMapping mapping) {
+            // AccessCheck expects generic rights in ACEs to be mapped to the
+            // object type's concrete rights (e.g. GA on a service DACL).
+            var sd = new RawSecurityDescriptor(descriptor, 0);
+            if (sd.DiscretionaryAcl != null) {
+                foreach (GenericAce ace in sd.DiscretionaryAcl) {
+                    var knownAce = ace as KnownAce;
+                    if (knownAce == null) continue;
+                    uint mask = unchecked((uint)knownAce.AccessMask);
+                    MapGenericMask(ref mask, ref mapping);
+                    knownAce.AccessMask = unchecked((int)mask);
+                }
+                descriptor = new byte[sd.BinaryLength];
+                sd.GetBinaryForm(descriptor, 0);
+            }
+            IntPtr duplicate;
+            if (!DuplicateToken(token, 2, out duplicate))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            IntPtr privileges = IntPtr.Zero;
+            try {
+                uint length = 1024, granted;
+                bool allowed;
+                privileges = Marshal.AllocHGlobal((int)length);
+                if (!AccessCheck(descriptor, duplicate, desired, ref mapping, privileges,
+                    ref length, out granted, out allowed)) {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error != 122) throw new Win32Exception(error);
+                    Marshal.FreeHGlobal(privileges);
+                    privileges = IntPtr.Zero;
+                    privileges = Marshal.AllocHGlobal((int)length);
+                    if (!AccessCheck(descriptor, duplicate, desired, ref mapping, privileges,
+                        ref length, out granted, out allowed))
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                return allowed;
+            } finally {
+                if (privileges != IntPtr.Zero) Marshal.FreeHGlobal(privileges);
+                CloseHandle(duplicate);
             }
         }
-    } catch {}
+        public static bool Allows(byte[] descriptor, IntPtr token, uint desired) {
+            var mapping = new GenericMapping {
+                Read = 0x120089, Write = 0x120116, Execute = 0x1200A0, All = 0x1F01FF
+            };
+            return Check(descriptor, token, desired, mapping);
+        }
+        public static bool AllowsService(byte[] descriptor, IntPtr token, uint desired) {
+            var mapping = new GenericMapping {
+                Read = 0x2008D, Write = 0x20002, Execute = 0x20170, All = 0xF01FF
+            };
+            return Check(descriptor, token, desired, mapping);
+        }
+    }
+}
+'@
+}
+
+function Test-ServiceModifyAccess([string]$Sddl, [IntPtr]$TokenHandle) {
+    try {
+        $rawDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+        # sc sdshow commonly omits owner/group; AccessCheck requires both.
+        # SYSTEM is a conservative fallback: it cannot grant caller owner rights.
+        $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+        if (-not $rawDescriptor.Owner) { $rawDescriptor.Owner = $systemSid }
+        if (-not $rawDescriptor.Group) { $rawDescriptor.Group = $systemSid }
+        $descriptor = [byte[]]::new($rawDescriptor.BinaryLength)
+        $rawDescriptor.GetBinaryForm($descriptor, 0)
+        Initialize-AclAccessCheck
+        foreach ($right in @(0x2, 0x40000, 0x80000)) {
+            if ([PrivHound.FileAccess]::AllowsService($descriptor, $TokenHandle, $right)) { return $true }
+        }
+    } catch { Write-Verbose "Could not evaluate service SDDL access: $_" }
+    return $false
+}
+
+function Get-ServiceSddl([string]$Name) {
+    if (-not $Script:CachedServiceSDDL.ContainsKey($Name)) {
+        $output = sc.exe sdshow $Name 2>$null
+        $sddl = $output | Where-Object { $_ -match '^\s*[OGDS]:' } | Select-Object -Last 1
+        $Script:CachedServiceSDDL[$Name] = if ($sddl) { $sddl.Trim() } else { $null }
+    }
+    return $Script:CachedServiceSDDL[$Name]
+}
+
+function Test-WritableAcl([string]$Path, [IntPtr]$TokenHandle=[IntPtr]::Zero) {
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -EA Stop
+        if ($TokenHandle -eq [IntPtr]::Zero) {
+            if ($null -eq $Script:AclIdentity) {
+                $Script:AclIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+                $principal = [Security.Principal.WindowsPrincipal]::new($Script:AclIdentity)
+                $Script:AclIsAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            }
+            if ($Script:AclIsAdmin) { return $false }
+            $TokenHandle = $Script:AclIdentity.Token
+        }
+        Initialize-AclAccessCheck
+        $descriptor = (Get-Acl -LiteralPath $item.FullName -EA Stop).GetSecurityDescriptorBinaryForm()
+        # Content writes, WRITE_DAC, and WRITE_OWNER can change file contents.
+        # Attribute-only, append-only, and DELETE-only rights do not qualify.
+        foreach ($right in @(0x2, 0x40000, 0x80000)) {
+            if ([PrivHound.FileAccess]::Allows($descriptor, $TokenHandle, $right)) { return $true }
+        }
+        if (-not $item.PSIsContainer -and $item.Directory) {
+            $parent = (Get-Acl -LiteralPath $item.Directory.FullName -EA Stop).GetSecurityDescriptorBinaryForm()
+            $canCreate = [PrivHound.FileAccess]::Allows($parent, $TokenHandle, 0x2)
+            if ($canCreate -and (
+                [PrivHound.FileAccess]::Allows($descriptor, $TokenHandle, 0x10000) -or
+                [PrivHound.FileAccess]::Allows($parent, $TokenHandle, 0x40))) { return $true }
+        }
+    } catch { Write-Verbose "Could not evaluate file access for '$Path': $_" }
     return $false
 }
 
 # ── GPP CPASSWORD DECRYPTION ─────────
 function Decrypt-GPPPassword([string]$Cpassword) {
-    # MS14-025: Publicly known AES-256 key used by Microsoft for GPP cpassword encryption
+    # MS14-025: Microsoft used a publicly known AES-256 key for GPP cpassword encryption.
     # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gppref/
     try {
         # Pad Base64 to multiple of 4
@@ -399,7 +552,7 @@ function Get-UnattendPasswords([string]$FilePath) {
                     try { $value = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }
                     catch { }
                 }
-                # Microsoft appends known suffixes before Base64 encoding; strip them
+                # Remove Microsoft's known suffixes, which are added before Base64 encoding.
                 foreach ($suffix in @("Password","AdministratorPassword")) {
                     if ($value -and $value.EndsWith($suffix)) { $value = $value.Substring(0, $value.Length - $suffix.Length) }
                 }
@@ -438,7 +591,7 @@ function Get-UnattendPasswords([string]$FilePath) {
                     try { $value = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value)) }
                     catch { }
                 }
-                # Microsoft appends known suffixes before Base64 encoding; strip them
+                # Remove Microsoft's known suffixes, which are added before Base64 encoding.
                 foreach ($suffix in @("AdministratorPassword","Password")) {
                     if ($value -and $value.EndsWith($suffix)) { $value = $value.Substring(0, $value.Length - $suffix.Length) }
                 }
@@ -461,6 +614,14 @@ function Get-CachedServices {
     return $Script:CachedServices
 }
 
+function Get-UnquotedServiceCandidates([object[]]$Services) {
+    $system32Prefix = (Join-Path $env:SystemRoot 'System32').TrimEnd('\') + '\'
+    $Services | Where-Object {
+        $_.PathName -and $_.PathName -notlike '"*' -and $_.PathName -match '\s' -and
+        -not $_.PathName.StartsWith($system32Prefix, [StringComparison]::OrdinalIgnoreCase)
+    }
+}
+
 function Get-CachedLocalUsers {
     if ($null -eq $Script:CachedLocalUsers) {
         $Script:CachedLocalUsers = @(Get-LocalUsers)
@@ -468,17 +629,40 @@ function Get-CachedLocalUsers {
     return $Script:CachedLocalUsers
 }
 
+function Get-HistoryCredentials([string]$Content) {
+    $results = [System.Collections.ArrayList]::new()
+    $patterns = @(
+        @{Pattern='ConvertTo-SecureString[ \t]+[''"]([^''"]+)[''"][ \t]+-AsPlainText';PasswordGroup=1},
+        @{Pattern='-Password[ \t]+[''"]([^''"]+)[''"]';PasswordGroup=1},
+        @{Pattern='net[ \t]+use[ \t]+[^\r\n]*?/user:(\S+)[ \t]+(\S+)';PasswordGroup=2;UserGroup=1}
+    )
+    foreach ($pattern in $patterns) {
+        foreach ($match in [regex]::Matches(
+            $Content, $pattern.Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+            $password = $match.Groups[$pattern.PasswordGroup].Value
+            if (-not $password) { continue }
+            $username = if ($pattern.UserGroup) { $match.Groups[$pattern.UserGroup].Value } else { $null }
+            [void]$results.Add(@{username=$username;password=$password})
+        }
+    }
+    return $results.ToArray()
+}
+
 # ── LOCAL USER ENUMERATION ────────────
 function Get-LocalUsers {
     $users = @()
     $adminMembers = @()
-    # Get admin group members
+    $adminSids = @()
+    $adminSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $adminGroupName = $adminSid.Translate([Security.Principal.NTAccount]).Value -replace '^[^\\]+\\', ''
+    # Resolve the local Administrators group by SID; its display name varies by language.
     try {
-        $adminGroup = Get-LocalGroupMember -Group "Administrators" -EA SilentlyContinue
-        $adminMembers = $adminGroup | ForEach-Object { $_.Name -replace '^[^\\]+\\', '' }
+        $members = Get-LocalGroupMember -Group $adminGroupName -EA Stop
+        $adminMembers = @($members | ForEach-Object { $_.Name -replace '^[^\\]+\\', '' })
+        $adminSids = @($members | Where-Object { $_.SID } | ForEach-Object { $_.SID.Value })
     } catch {
         try {
-            $netOut = net localgroup Administrators 2>$null
+            $netOut = net localgroup $adminGroupName 2>$null
             $inMembers = $false
             foreach ($line in $netOut) {
                 if ($line -match "^-+$") { $inMembers = $true; continue }
@@ -492,7 +676,7 @@ function Get-LocalUsers {
     try {
         $localUsers = Get-LocalUser -EA SilentlyContinue | Where-Object { $_.Enabled -eq $true }
         foreach ($u in $localUsers) {
-            $isAdmin = $adminMembers -contains $u.Name
+            $isAdmin = $adminSids -contains $u.SID.Value -or $adminMembers -contains $u.Name
             $users += @{ Name = $u.Name; SID = $u.SID.Value; IsAdmin = $isAdmin }
         }
     } catch {
@@ -561,9 +745,6 @@ namespace PrivHound {
             IntPtr TokenInformation, int TokenInformationLength,
             out int ReturnLength);
 
-        [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        public static extern bool ConvertSidToStringSid(IntPtr pSid, out string strSid);
-
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern bool LookupPrivilegeName(
             string lpSystemName, IntPtr lpLuid,
@@ -595,54 +776,6 @@ function Get-TokenWithCredential([string]$Username, [string]$Password) {
     return [IntPtr]::Zero
 }
 
-function Get-TokenGroupSids([IntPtr]$TokenHandle) {
-    $groups = [System.Collections.ArrayList]::new()
-    [void]$groups.Add("Everyone")
-    [void]$groups.Add("Authenticated Users")
-    try {
-        Initialize-TokenInfoType
-        # TokenGroups = 2
-        $tokenInfoLen = 0
-        [PrivHound.TokenInfo]::GetTokenInformation($TokenHandle, 2, [IntPtr]::Zero, 0, [ref]$tokenInfoLen) | Out-Null
-        if ($tokenInfoLen -eq 0) { return $groups.ToArray() }
-        $tokenInfo = [Runtime.InteropServices.Marshal]::AllocHGlobal($tokenInfoLen)
-        try {
-            if (-not [PrivHound.TokenInfo]::GetTokenInformation($TokenHandle, 2, $tokenInfo, $tokenInfoLen, [ref]$tokenInfoLen)) {
-                return $groups.ToArray()
-            }
-            # TOKEN_GROUPS: first 4 bytes = GroupCount, then array of SID_AND_ATTRIBUTES (IntPtr Sid + uint Attributes)
-            $groupCount = [Runtime.InteropServices.Marshal]::ReadInt32($tokenInfo)
-            $ptrSize = [IntPtr]::Size
-            $structSize = $ptrSize + 4  # IntPtr Sid + DWORD Attributes
-            for ($i = 0; $i -lt $groupCount; $i++) {
-                $offset = 4 + ($i * $structSize)
-                # Align offset for pointer size
-                if ($ptrSize -eq 8) {
-                    $rem = $offset % 8
-                    if ($rem -ne 0) { $offset += (8 - $rem) }
-                }
-                $sidPtr = [Runtime.InteropServices.Marshal]::ReadIntPtr($tokenInfo, $offset)
-                if ($sidPtr -eq [IntPtr]::Zero) { continue }
-                $sidStr = $null
-                if ([PrivHound.TokenInfo]::ConvertSidToStringSid($sidPtr, [ref]$sidStr)) {
-                    [void]$groups.Add($sidStr)
-                    # Translate SID to NTAccount name
-                    try {
-                        $sidObj = New-Object System.Security.Principal.SecurityIdentifier($sidStr)
-                        $ntAccount = $sidObj.Translate([System.Security.Principal.NTAccount]).Value
-                        [void]$groups.Add($ntAccount)
-                    } catch {}
-                }
-            }
-        } finally {
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($tokenInfo)
-        }
-    } catch {
-        Write-PHStatus "Token group extraction error: $_" "warn"
-    }
-    return $groups.ToArray()
-}
-
 function Get-TokenPrivilegeNames([IntPtr]$TokenHandle) {
     $privNames = [System.Collections.ArrayList]::new()
     try {
@@ -656,7 +789,7 @@ function Get-TokenPrivilegeNames([IntPtr]$TokenHandle) {
             if (-not [PrivHound.TokenInfo]::GetTokenInformation($TokenHandle, 3, $tokenInfo, $tokenInfoLen, [ref]$tokenInfoLen)) {
                 return $privNames.ToArray()
             }
-            # TOKEN_PRIVILEGES: DWORD PrivilegeCount, then array of LUID_AND_ATTRIBUTES (8-byte LUID + 4-byte Attributes)
+            # TOKEN_PRIVILEGES starts with a DWORD count, then 12-byte entries.
             $privCount = [Runtime.InteropServices.Marshal]::ReadInt32($tokenInfo)
             for ($i = 0; $i -lt $privCount; $i++) {
                 $offset = 4 + ($i * 12)  # LUID(8) + Attributes(4) = 12 bytes each
@@ -701,96 +834,24 @@ function Initialize-CoreNodes {
 # ── CHECK 1: SERVICES ─────────────────
 function Check-WeakServicePermissions {
     Write-PHStatus "Checking service permissions..."
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]$currentIdentity
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-PHStatus "Skipping service privilege escalation checks for elevated administrator; run as a standard user" "warn"
+        return
+    }
     $count = 0
     $svcs = Get-CachedServices | Where-Object { $_.PathName }
     $localUsers = $null
-
-    $dangerousRights = @('DC','WP','WD','WO','SD')
-
-    # Well-known alias -> SID mappings for resolution
-    $wellKnownSids = @{
-        'SY' = 'S-1-5-18'     # SYSTEM — local system account, highest local privilege
-        'BA' = 'S-1-5-32-544' # Builtin\Administrators — local admin group
-        'BU' = 'S-1-5-32-545' # Builtin\Users — all local users, low privilege
-        'IU' = 'S-1-5-4'      # Interactive Users — any user logged on locally/RDP
-        'AU' = 'S-1-5-11'     # Authenticated Users — any successfully authed account (local or domain), excludes Anonymous
-        'WD' = 'S-1-1-0'      # Everyone — all users including Anonymous (pre-Vista behaviour); post-Vista excludes Anonymous in most contexts
-        'SU' = 'S-1-5-6'      # Service — any account running as a service
-        'NS' = 'S-1-5-20'     # Network Service — low-privilege service account with network credentials
-        'LS' = 'S-1-5-19'     # Local Service — low-privilege service account, no network credentials
-    }
-
-    # Principals we flag unconditionally (unprivileged groups)
-    $flaggedAliases = @('BU','AU','WD','IU')
-    $flaggedSids    = $flaggedAliases | ForEach-Object { $wellKnownSids[$_] }
-
-    # Add the current user's SID and all their group SIDs
-    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $currentUserSids = @($currentIdentity.User.Value) +  @($currentIdentity.Groups | ForEach-Object { $_.Value })
-
-    $allFlaggedSids = ($flaggedSids + $currentUserSids) | Sort-Object -Unique
-
-    function Resolve-AcePrincipal {
-        param([string]$Principal)
-        if ($wellKnownSids.ContainsKey($Principal)) {
-            return $wellKnownSids[$Principal]
-        }
-        # Already a raw SID
-        if ($Principal -match '^S-\d-') {
-            return $Principal
-        }
-        # Try NTAccount resolution for domain SIDs / group names
-        try {
-            $account = New-Object Security.Principal.NTAccount($Principal)
-            return $account.Translate([Security.Principal.SecurityIdentifier]).Value
-        } catch {
-            return $null
-        }
-    }
-
-    function Parse-ServiceSddl {
-        param([string]$Sddl)
-
-        $acePattern = '\((?<type>[A-Z]+);(?<flags>[A-Z]*);(?<rights>[A-Z]*);[^;]*;[^;]*;(?<principal>[^)]+)\)'
-
-        [regex]::Matches($Sddl, $acePattern) | ForEach-Object {
-            $type      = $_.Groups['type'].Value
-            $flags     = $_.Groups['flags'].Value
-            $rightsRaw = $_.Groups['rights'].Value
-            $principal = $_.Groups['principal'].Value
-
-            # Only process allow ACEs
-            if ($type -ne 'A') { return }
-
-            # Split rights string into 2-char tokens
-            $rights = $rightsRaw -split '(?<=\G.{2})' | Where-Object { $_ -ne '' }
-
-            $matched = $rights | Where-Object { $_ -in $dangerousRights }
-            if (-not $matched) { return }
-
-            $resolvedSid = Resolve-AcePrincipal -Principal $principal
-            if ($resolvedSid -notin $allFlaggedSids) { return }
-
-            [PSCustomObject]@{
-                ACE            = $_.Value
-                Principal      = $principal
-                ResolvedSid    = $resolvedSid
-                DangerousRights = $matched -join ','
-                AllRights      = $rights -join ','
-                IsCurrentUser  = $resolvedSid -in $currentUserSids
-            }
-        }
-    }
+    if ($null -eq $Script:AclIdentity) { $Script:AclIdentity = $currentIdentity }
+    $currentToken = $Script:AclIdentity.Token
 
     foreach ($svc in $svcs) {
-        # Check if current user can modify service config via SDDL
+        # AccessCheck evaluates allow/deny ACEs against the effective token.
         $canModify = $false
         try {
-            $sd = sc.exe sdshow $svc.Name 2>$null
-            if ($sd) { $Script:CachedServiceSDDL[$svc.Name] = $sd }
-            if (Parse-ServiceSddl -Sddl $sd) {
-                $canModify = $true
-            }
+            $sddl = Get-ServiceSddl $svc.Name
+            if ($sddl) { $canModify = Test-ServiceModifyAccess $sddl $currentToken }
         } catch {}
 
         # Extract and check binary path writability
@@ -865,7 +926,7 @@ function Check-WeakServicePermissions {
 function Check-UnquotedServicePaths {
     Write-PHStatus "Checking unquoted service paths..."
     $count = 0
-    $svcs = Get-CachedServices | Where-Object { $_.PathName -and $_.PathName -notlike '"*' -and $_.PathName -match '\s' -and $_.PathName -notlike 'C:\Windows\system32\*' }
+    $svcs = Get-UnquotedServiceCandidates (Get-CachedServices)
     foreach ($svc in $svcs) {
         $parts = $svc.PathName -split '\s+'
         $build = ""; $hijack = ""
@@ -891,18 +952,30 @@ function Check-UnquotedServicePaths {
 # ── CHECK 3: DLL HIJACKING ────────────
 function Check-DLLHijacking {
     Write-PHStatus "Checking writable PATH dirs..."
+    $count = Add-WritablePathObservations $Script:CurrentUserId
+    Write-PHStatus "Found $count writable PATH dir(s)" $(if($count){"finding"}else{"info"})
+}
+
+function Add-WritablePathObservations([string]$UserId, [IntPtr]$TokenHandle=[IntPtr]::Zero) {
     $count = 0
-    foreach ($dir in ($env:PATH -split ";")) {
-        if (-not $dir -or $dir -match "^C:\\Windows") { continue }
-        if (Test-WritableAcl $dir) {
+    $machinePath = @([Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';')
+    $windowsRoot = $env:SystemRoot.TrimEnd('\')
+    foreach ($dir in ($env:PATH -split ";" | Select-Object -Unique)) {
+        if (-not $dir) { continue }
+        $expandedDir = [Environment]::ExpandEnvironmentVariables($dir).TrimEnd('\')
+        if ($expandedDir -ieq $windowsRoot -or
+            $expandedDir.StartsWith("$windowsRoot\", [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if (Test-WritableAcl $dir $TokenHandle) {
+            $scope = if ($machinePath -contains $dir) { 'machine' } else { 'user/process' }
             $nid = New-PHId "pathdir" $dir
-            Add-PHNode $nid @("PHWritablePath") @{name="PATH:$dir@$Script:HOSTNAME";directory=$dir;hostname=$Script:HOSTNAME}
-            Add-PHEdge $Script:CurrentUserId $nid "PHCanWriteTo" @{mitre="T1574.001"}
-            Add-PHEdge $nid $Script:SystemNodeId "PHDLLHijackTo"
-            Add-PHFinding "DLLHijack" "MEDIUM" "Writable PATH: $dir" "Place DLL"; $count++
+            Add-PHNode $nid @("PHWritablePath") @{name="PATH:$dir@$Script:HOSTNAME";directory=$dir;scope=$scope;hostname=$Script:HOSTNAME}
+            $properties = @{scope=$scope}
+            if ($TokenHandle -ne [IntPtr]::Zero) { $properties.discovered_via = 'credential' }
+            Add-PHEdge $UserId $nid "PHCanWriteTo" $properties
+            Add-PHFinding "DLLHijack" "MEDIUM" "Writable $scope collector PATH: $dir (principal: $UserId; privileged DLL loading unverified)" "Identify a privileged process that loads from this directory"; $count++
         }
     }
-    Write-PHStatus "Found $count writable PATH dir(s)" $(if($count){"finding"}else{"info"})
+    return $count
 }
 
 # ── CHECK 4: ALWAYSINSTALLELEVATED ────
@@ -925,6 +998,11 @@ function Check-AlwaysInstallElevated {
 # ── CHECK 5: TOKEN PRIVILEGES ─────────
 function Check-TokenPrivileges {
     Write-PHStatus "Checking token privileges..."
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-PHStatus "Skipping token privilege escalation checks for elevated administrator; run as a standard user" "warn"
+        return
+    }
     $count = 0; $out=whoami /priv 2>$null
     foreach ($priv in $Script:DangerousPrivileges) {
         $privLine = $out | Where-Object { $_ -match "^\s*$priv\s+" }
@@ -981,7 +1059,9 @@ function Check-ScheduledTasks {
     try { $tasks = Get-ScheduledTask -EA SilentlyContinue | Where-Object { $_.Principal.UserId -match "SYSTEM|LocalSystem|S-1-5-18" -and $_.State -ne "Disabled" } } catch { return }
     foreach ($t in $tasks) {
         foreach ($a in $t.Actions) {
-            $exe = ($a.Execute -replace '^"([^"]+)".*','$1').Trim()
+            $execute = $a.PSObject.Properties['Execute']
+            if (-not $execute -or -not $execute.Value) { continue }
+            $exe = ($execute.Value -replace '^"([^"]+)".*','$1').Trim()
             if ($exe -and (Test-Path $exe -EA SilentlyContinue) -and (Test-WritableAcl $exe)) {
                 $nid = New-PHId "task" $t.TaskName
                 Add-PHNode $nid @("PHScheduledTask") @{name="TASK:$($t.TaskName)@$Script:HOSTNAME";task_name=$t.TaskName;executable=$exe;hostname=$Script:HOSTNAME}
@@ -1008,11 +1088,11 @@ function Check-AutoRuns {
                 if ($_.Value -match '([A-Za-z]:\\[^\s"]+\.exe)') {
                     $exe = $Matches[1]
                     if ((Test-Path $exe -EA SilentlyContinue) -and (Test-WritableAcl $exe)) {
+                        $scope = if ($rp -like 'HKCU:*') { 'user' } else { 'machine' }
                         $nid = New-PHId "autorun" "$($_.Name)_$rp"
-                        Add-PHNode $nid @("PHAutoRun") @{name="AUTORUN:$($_.Name)@$Script:HOSTNAME";reg_key=$rp;executable=$exe;hostname=$Script:HOSTNAME}
-                        Add-PHEdge $Script:CurrentUserId $nid "PHCanWriteAutorun" @{mitre="T1547.001"}
-                        if ($rp -match "^HKLM") { Add-PHEdge $nid $Script:AdminNodeId "PHExecutesAs" }
-                        Add-PHFinding "Autorun" "MEDIUM" "Writable autorun '$($_.Name)': $exe" "Replace binary"
+                        Add-PHNode $nid @("PHAutoRun") @{name="AUTORUN:$($_.Name)@$Script:HOSTNAME";reg_key=$rp;executable=$exe;scope=$scope;hostname=$Script:HOSTNAME}
+                        Add-PHEdge $Script:CurrentUserId $nid "PHCanWriteAutorun" @{mitre="T1547.001";scope=$scope}
+                        Add-PHFinding "Autorun" "MEDIUM" "Writable $scope autorun '$($_.Name)': $exe (privileged startup unverified)" "Check whether a higher-privilege user executes this binary"
                         $count++
                     }
                 }
@@ -1069,7 +1149,6 @@ function Check-StoredCredentials {
     if ($currentEntry) { $ckEntries += $currentEntry }
 
     if ($ckEntries.Count -gt 0) {
-        $localUsers = Get-CachedLocalUsers
         foreach ($entry in $ckEntries) {
             $entryLabel = ($entry.Target -replace '[^a-zA-Z0-9_\-]','_')
             $nid = New-PHId "cred" "cmdkey_$entryLabel"
@@ -1080,33 +1159,11 @@ function Check-StoredCredentials {
                 cred_type  = $entry.Type
                 cred_user  = $entry.User
                 hostname   = $Script:HOSTNAME
+                reusable_for_runas = $false
             }
-            Add-PHEdge $Script:CurrentUserId $nid "PHHasStoredCreds"
+            Add-PHEdge $Script:CurrentUserId $nid "PHHasStoredCreds" @{reusable_for_runas=$false}
             $count++
-            # Try to resolve target user and create PHCanLoginViaRunas edge
-            if ($entry.User) {
-                $targetUserName = $entry.User -replace '^[^\\]+\\', ''
-                $matchedUser = $localUsers | Where-Object { $_.Name -eq $targetUserName }
-                if ($matchedUser) {
-                    $luNodeId = New-PHId "localuser" $matchedUser.Name
-                    Add-PHNode $luNodeId @("PHLocalUser") @{
-                        name     = "LOCALUSER:$($matchedUser.Name)@$Script:HOSTNAME"
-                        username = $matchedUser.Name
-                        sid      = $matchedUser.SID
-                        is_admin = $matchedUser.IsAdmin
-                        hostname = $Script:HOSTNAME
-                    }
-                    Add-PHEdge $nid $luNodeId "PHCanLoginViaRunas" @{mitre="T1555.004";technique="runas /savecred"}
-                    if ($matchedUser.IsAdmin) {
-                        Add-PHEdge $luNodeId $Script:AdminNodeId "PHMemberOf" @{group="BUILTIN\Administrators"}
-                    }
-                    Add-PHFinding "Creds" "HIGH" "Stored cred for '$($entry.User)' → can runas '$($matchedUser.Name)'" "runas /savecred /user:$($entry.User) cmd.exe"
-                } else {
-                    Add-PHFinding "Creds" "MEDIUM" "Stored cred for '$($entry.User)' (target: $($entry.Target))" "runas /savecred /user:$($entry.User) cmd.exe"
-                }
-            } else {
-                Add-PHFinding "Creds" "MEDIUM" "Stored credential for target: $($entry.Target)" "cmdkey /list"
-            }
+            Add-PHFinding "Creds" "MEDIUM" "Stored credential entry for '$($entry.User)' (target: $($entry.Target); runas reuse unverified)" "Review Credential Manager entry"
         }
     }
     try{$al=Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -EA SilentlyContinue
@@ -1132,7 +1189,7 @@ function Check-GPPPasswords {
     $count = 0
     $gppFiles = @("Groups.xml","Services.xml","Scheduledtasks.xml","DataSources.xml","Printers.xml","Drives.xml")
     $searchPaths = @(
-        "$env:SystemDrive\ProgramData\Microsoft\Group Policy\History",
+        "$env:ProgramData\Microsoft\Group Policy\History",
         "$env:SystemRoot\SYSVOL"
     )
     foreach ($base in $searchPaths) {
@@ -1198,30 +1255,19 @@ function Check-PSHistory {
     if (Test-Path $histPath -EA SilentlyContinue) {
         $nid = New-PHId "pshist" "ConsoleHost_history"
         Add-PHNode $nid @("PHPSHistory") @{name="PSHIST:ConsoleHost_history@$Script:HOSTNAME";file_path=$histPath;source="PSReadLine";hostname=$Script:HOSTNAME}
-        Add-PHEdge $Script:CurrentUserId $nid "PHCanReadHistory" @{mitre="T1552.001"}
-        Add-PHFinding "PSHistory" "MEDIUM" "PowerShell history: $histPath" "type $histPath"
+        Add-PHEdge $Script:CurrentUserId $nid "PHCanReadHistory" @{source="own-profile"}
+        Add-PHFinding "PSHistory" "MEDIUM" "PowerShell history present: $histPath (credentials unverified)" "Review history for sensitive content"
         $count++
         # Mine credentials from history
         try {
             $histContent = Get-Content $histPath -Raw -EA SilentlyContinue
             if ($histContent) {
-                $credPatterns = @(
-                    @{Pattern='ConvertTo-SecureString\s+[''"]([^''"]+)[''"]\s+-AsPlainText';Group=1;Label="SecureString"},
-                    @{Pattern='-Password\s+[''"]([^''"]+)[''"]';Group=1;Label="Password param"},
-                    @{Pattern='net\s+use\s+.*?/user:(\S+)\s+(\S+)';Group=2;UserGroup=1;Label="net use"},
-                    @{Pattern='PSCredential\(\s*[''"]([^''"]+)[''"]\s*,';Group=0;UserGroup=1;Label="PSCredential"}
-                )
                 $foundCreds = $false
-                foreach ($cp in $credPatterns) {
-                    $ms = [regex]::Matches($histContent, $cp.Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                    foreach ($m in $ms) {
-                        $pw = $m.Groups[$cp.Group].Value
-                        $un = if ($cp.UserGroup) { $m.Groups[$cp.UserGroup].Value } else { $null }
-                        if ($pw) {
-                            [void]$Script:ExtractedCreds.Add(@{ source="PSHistory"; username=$un; password=$pw; nodeId=$nid })
-                            $foundCreds = $true
-                        }
-                    }
+                foreach ($cred in (Get-HistoryCredentials $histContent)) {
+                    [void]$Script:ExtractedCreds.Add(@{
+                        source="PSHistory"; username=$cred.username; password=$cred.password; nodeId=$nid
+                    })
+                    $foundCreds = $true
                 }
                 if ($foundCreds) {
                     Add-PHEdge $nid $nid "PHContainsCreds" @{source="PSHistory"}
@@ -1327,12 +1373,11 @@ function Check-UACBypass {
         $uacReg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -EA SilentlyContinue
         $enableLUA = $uacReg.EnableLUA
         $consentBehavior = $uacReg.ConsentPromptBehaviorAdmin
-        $localFilter = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name LocalAccountTokenFilterPolicy -EA SilentlyContinue).LocalAccountTokenFilterPolicy
+        $localFilter = $uacReg.PSObject.Properties['LocalAccountTokenFilterPolicy']
         $cu = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-        $isAdmin = ([Security.Principal.WindowsPrincipal]$cu).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        $inAdminGroup = $false
-        try { $inAdminGroup = (net localgroup Administrators 2>$null | ForEach-Object { $_.Trim() }) -contains $env:USERNAME -or (net localgroup Administrators 2>$null | ForEach-Object { $_.Trim() }) -contains "$env:USERDOMAIN\$env:USERNAME" } catch {}
+        $isElevated = ([Security.Principal.WindowsPrincipal]$cu).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+        $inAdminGroup = @($cu.Groups | Where-Object { $_.Value -eq 'S-1-5-32-544' }).Count -gt 0
 
         if ($enableLUA -eq 0) {
             $nid = New-PHId "uac" "LUA_disabled"
@@ -1349,17 +1394,13 @@ function Check-UACBypass {
             Add-PHFinding "UAC" "HIGH" "UAC set to never prompt (ConsentBehaviorAdmin=0)" "Start-Process -Verb RunAs"
             Write-PHStatus "UAC never prompts!" "finding"
         } elseif ($inAdminGroup -and -not $isElevated) {
-            $nid = New-PHId "uac" "AdminNotElevated"
-            Add-PHNode $nid @("PHUACBypass") @{name="UAC:ADMIN_NOT_ELEVATED@$Script:HOSTNAME";hostname=$Script:HOSTNAME;enableLUA=$enableLUA;consentBehavior=$consentBehavior}
-            Add-PHEdge $Script:CurrentUserId $nid "PHCanBypassUAC" @{mitre="T1548.002";technique="fodhelper/eventvwr bypass"}
-            Add-PHEdge $nid $Script:AdminNodeId "PHEscalatesTo"
-            Add-PHFinding "UAC" "HIGH" "User in Administrators group but not elevated" "fodhelper.exe / eventvwr.exe UAC bypass"
-            Write-PHStatus "Admin user not elevated - UAC bypass possible" "finding"
+            Add-PHFinding "UAC" "MEDIUM" "Administrator running with a filtered token (normal UAC behavior; bypass unverified)" "Verify UAC policy before considering an elevation technique"
+            Write-PHStatus "Administrator running with a normal filtered token (no bypass verified)" "info"
         } else {
             Write-PHStatus "UAC configured (EnableLUA=$enableLUA, Consent=$consentBehavior)" "info"
         }
 
-        if ($localFilter -eq 1) {
+        if ($localFilter -and $localFilter.Value -eq 1) {
             Add-PHFinding "UAC" "MEDIUM" "LocalAccountTokenFilterPolicy=1 (remote admin via local accounts)" "Pass-the-hash with local admin"
             Write-PHStatus "LocalAccountTokenFilterPolicy=1" "finding"
         }
@@ -1388,7 +1429,7 @@ function Check-WritableProgramDirs {
                     $count++
 
                     # Cross-reference: services with binaries in this directory
-                    $dirPattern = [regex]::Escape($d.FullName)
+                    $dirPattern = '^"?' + [regex]::Escape($d.FullName.TrimEnd('\')) + '\\'
                     foreach ($svc in $allServices) {
                         if ($svc.PathName -and $svc.PathName -match $dirPattern) {
                             $svcNid = New-PHId "service" $svc.Name
@@ -1426,7 +1467,11 @@ function Check-WritableProgramDirs {
 function Check-CrossUserProfiles {
     Write-PHStatus "Checking cross-user profile access..."
     $count = 0
-    $usersDir = "$env:SystemDrive\Users"
+    $profilesDir = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' `
+        -Name ProfilesDirectory -EA SilentlyContinue).ProfilesDirectory
+    $usersDir = if ($profilesDir) { [Environment]::ExpandEnvironmentVariables($profilesDir) } else {
+        Join-Path $env:SystemDrive 'Users'
+    }
     if (-not (Test-Path $usersDir)) { return }
     $currentUser = $env:USERNAME
     $excludeDirs = @("Public","Default","Default User","All Users",$currentUser)
@@ -1509,21 +1554,12 @@ function Check-CrossUserProfiles {
                     try {
                         $histContent = Get-Content $sf.FullName -Raw -EA SilentlyContinue
                         if ($histContent) {
-                            $credPatterns = @(
-                                @{Pattern='ConvertTo-SecureString\s+[''"]([^''"]+)[''"]\s+-AsPlainText';Group=1},
-                                @{Pattern='-Password\s+[''"]([^''"]+)[''"]';Group=1},
-                                @{Pattern='net\s+use\s+.*?/user:(\S+)\s+(\S+)';Group=2;UserGroup=1}
-                            )
-                            foreach ($cp in $credPatterns) {
-                                $ms = [regex]::Matches($histContent, $cp.Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                                foreach ($m in $ms) {
-                                    $pw = $m.Groups[$cp.Group].Value
-                                    $un = if ($cp.UserGroup) { $m.Groups[$cp.UserGroup].Value } else { $null }
-                                    if ($pw) {
-                                        [void]$Script:ExtractedCreds.Add(@{ source="CrossProfile-PSHistory"; username=$un; password=$pw; nodeId=$sfNid })
-                                        Add-PHEdge $sfNid $sfNid "PHContainsCreds" @{source="PSHistory"}
-                                    }
-                                }
+                            foreach ($cred in (Get-HistoryCredentials $histContent)) {
+                                [void]$Script:ExtractedCreds.Add(@{
+                                    source="CrossProfile-PSHistory"; username=$cred.username
+                                    password=$cred.password; nodeId=$sfNid
+                                })
+                                Add-PHEdge $sfNid $sfNid "PHContainsCreds" @{source="PSHistory"}
                             }
                         }
                     } catch {}
@@ -1575,7 +1611,7 @@ function Check-CredentialLoginPaths {
 
     # GPP XML credential collection
     $gppFiles = @("Groups.xml","Services.xml","Scheduledtasks.xml","DataSources.xml","Printers.xml","Drives.xml")
-    $gppSearchPaths = @("$env:SystemDrive\ProgramData\Microsoft\Group Policy\History","$env:SystemRoot\SYSVOL")
+    $gppSearchPaths = @("$env:ProgramData\Microsoft\Group Policy\History","$env:SystemRoot\SYSVOL")
     foreach ($base in $gppSearchPaths) {
         if (-not (Test-Path $base -EA SilentlyContinue)) { continue }
         foreach ($gf in $gppFiles) {
@@ -1657,11 +1693,10 @@ function Check-CredentialLoginPaths {
     foreach ($cred in $Script:ExtractedCreds) {
         foreach ($lu in $localUsers) {
             $pairKey = "$($lu.Name)|$($cred.password)"
-            if ($testedPairs.ContainsKey($pairKey)) { continue }
-            $testedPairs[$pairKey] = $true
-
-            $valid = Test-LocalCredential $lu.Name $cred.password
-            if ($valid) {
+            if (-not $testedPairs.ContainsKey($pairKey)) {
+                $testedPairs[$pairKey] = Test-LocalCredential $lu.Name $cred.password
+            }
+            if ($testedPairs[$pairKey]) {
                 Write-PHStatus "Valid credential: $($cred.source) password works for $($lu.Name)!" "finding"
 
                 $luNodeId = New-PHId "localuser" $lu.Name
@@ -1748,15 +1783,8 @@ function Check-CrossUserPrivileges {
         }
 
         try {
-            $userGroups = Get-TokenGroupSids $token
             $userPrivs = Get-TokenPrivilegeNames $token
             $luNodeId = $vc.nodeId
-            $userSid = $vc.sid
-
-            # Also add the user's own SID and username to the groups list for ACL matching
-            $allGroups = @($userGroups)
-            if ($vc.username) { $allGroups += $vc.username }
-            if ($userSid) { $allGroups += $userSid }
 
             # ── Sub-check A: Service binary write ──
             foreach ($svc in $svcs) {
@@ -1766,7 +1794,7 @@ function Check-CrossUserPrivileges {
                 else { $bin = ($svc.PathName -split '\s+')[0] }
                 $bin = if ($bin) { $bin.Trim() } else { $null }
 
-                if ($bin -and (Test-Path $bin -EA SilentlyContinue) -and (Test-WritableAcl $bin $allGroups)) {
+                if ($bin -and (Test-Path $bin -EA SilentlyContinue) -and (Test-WritableAcl $bin $token)) {
                     $svcNodeId = New-PHId "service" $svc.Name
                     $isSystem = $svc.StartName -match "^(SYSTEM|LocalSystem|NT AUTHORITY\\SYSTEM)$"
                     Add-PHNode $svcNodeId @("PHService") @{
@@ -1784,21 +1812,9 @@ function Check-CrossUserPrivileges {
 
             # ── Sub-check B: Service SDDL modify ──
             foreach ($svc in $svcs) {
-                $sd = $Script:CachedServiceSDDL[$svc.Name]
+                $sd = Get-ServiceSddl $svc.Name
                 if (-not $sd) { continue }
-                $canMod = $false
-                # Check well-known group SIDs
-                if ($sd -match "\(A;;[A-Z]*?(WP|DC|WD|CC)[A-Z]*?;;;(BU|AU|WD|IU)\)") { $canMod = $true }
-                # Check user-specific SID
-                if (-not $canMod -and $userSid -and $sd -match "\(A;;[A-Z]*?(WP|DC|WD|CC)[A-Z]*?;;;$([regex]::Escape($userSid))\)") { $canMod = $true }
-                # Check group SIDs from token
-                if (-not $canMod) {
-                    foreach ($g in $userGroups) {
-                        if ($g -match '^S-1-') {
-                            if ($sd -match "\(A;;[A-Z]*?(WP|DC|WD|CC)[A-Z]*?;;;$([regex]::Escape($g))\)") { $canMod = $true; break }
-                        }
-                    }
-                }
+                $canMod = Test-ServiceModifyAccess $sd $token
                 if ($canMod) {
                     $svcNodeId = New-PHId "service" $svc.Name
                     $isSystem = $svc.StartName -match "^(SYSTEM|LocalSystem|NT AUTHORITY\\SYSTEM)$"
@@ -1816,7 +1832,7 @@ function Check-CrossUserPrivileges {
             }
 
             # ── Sub-check C: Unquoted path hijack ──
-            $uqSvcs = $svcs | Where-Object { $_.PathName -and $_.PathName -notlike '"*' -and $_.PathName -match '\s' -and $_.PathName -notlike 'C:\Windows\system32\*' }
+            $uqSvcs = Get-UnquotedServiceCandidates $svcs
             foreach ($svc in $uqSvcs) {
                 $parts = $svc.PathName -split '\s+'
                 $build = ""; $hijack = ""
@@ -1824,7 +1840,7 @@ function Check-CrossUserPrivileges {
                     if ($build) { $build += " " }; $build += $p
                     if ($build -match "\.exe$") { break }
                     $d = Split-Path $build -EA SilentlyContinue
-                    if ($d -and (Test-WritableAcl $d $allGroups)) { $hijack = "$build.exe"; break }
+                    if ($d -and (Test-WritableAcl $d $token)) { $hijack = "$build.exe"; break }
                 }
                 if ($hijack) {
                     $nid = New-PHId "unquoted" $svc.Name
@@ -1844,20 +1860,7 @@ function Check-CrossUserPrivileges {
             }
 
             # ── Sub-check D: DLL hijack PATH dirs ──
-            foreach ($dir in ($env:PATH -split ";")) {
-                if (-not $dir -or $dir -match "^C:\\Windows") { continue }
-                if (Test-WritableAcl $dir $allGroups) {
-                    $nid = New-PHId "pathdir" $dir
-                    Add-PHNode $nid @("PHWritablePath") @{
-                        name="PATH:$dir@$Script:HOSTNAME"; directory=$dir; hostname=$Script:HOSTNAME
-                    }
-                    Add-PHEdge $nid $Script:SystemNodeId "PHDLLHijackTo"
-                    Add-PHEdge $luNodeId $nid "PHCanWriteTo" @{
-                        mitre="T1574.001"; discovered_via="credential"
-                    }
-                    $count++
-                }
-            }
+            $count += Add-WritablePathObservations $luNodeId $token
 
             # ── Sub-check E: Scheduled task binary ──
             try {
@@ -1866,7 +1869,7 @@ function Check-CrossUserPrivileges {
                 }
                 foreach ($task in $tasks) {
                     foreach ($action in $task.Actions) {
-                        if ($action.Execute -and (Test-Path $action.Execute -EA SilentlyContinue) -and (Test-WritableAcl $action.Execute $allGroups)) {
+                        if ($action.Execute -and (Test-Path $action.Execute -EA SilentlyContinue) -and (Test-WritableAcl $action.Execute $token)) {
                             $taskNodeId = New-PHId "task" $task.TaskName
                             Add-PHNode $taskNodeId @("PHScheduledTask") @{
                                 name="TASK:$($task.TaskName)@$Script:HOSTNAME"
@@ -1895,7 +1898,7 @@ function Check-CrossUserPrivileges {
                         $arBin = $name.Value
                         if ($arBin -match '^"([^"]+)"') { $arBin = $Matches[1] }
                         elseif ($arBin -match '(\S+\.exe)') { $arBin = $Matches[1] }
-                        if ($arBin -and (Test-Path $arBin -EA SilentlyContinue) -and (Test-WritableAcl $arBin $allGroups)) {
+                        if ($arBin -and (Test-Path $arBin -EA SilentlyContinue) -and (Test-WritableAcl $arBin $token)) {
                             $arNodeId = New-PHId "autorun" "$rk\$($name.Name)"
                             Add-PHNode $arNodeId @("PHAutoRun") @{
                                 name="AUTORUN:$($name.Name)@$Script:HOSTNAME"
@@ -1917,7 +1920,7 @@ function Check-CrossUserPrivileges {
                 foreach ($pd in $progDirs) {
                     if (-not (Test-Path $pd -EA SilentlyContinue)) { continue }
                     foreach ($sub in (Get-ChildItem $pd -Directory -EA SilentlyContinue)) {
-                        if (Test-WritableAcl $sub.FullName $allGroups) {
+                        if (Test-WritableAcl $sub.FullName $token) {
                             $pdNodeId = New-PHId "progdir" $sub.FullName
                             Add-PHNode $pdNodeId @("PHWritableProgramDir") @{
                                 name="PROGDIR:$($sub.Name)@$Script:HOSTNAME"
@@ -1953,7 +1956,7 @@ function Check-CrossUserPrivileges {
             # ── Sub-check I: Service recovery command binary ──
             foreach ($svcName in $Script:CachedServiceRecovery.Keys) {
                 $recoveryBin = $Script:CachedServiceRecovery[$svcName]
-                if ($recoveryBin -and (Test-Path $recoveryBin -EA SilentlyContinue) -and (Test-WritableAcl $recoveryBin $allGroups)) {
+                if ($recoveryBin -and (Test-Path $recoveryBin -EA SilentlyContinue) -and (Test-WritableAcl $recoveryBin $token)) {
                     $svcObj = $svcs | Where-Object { $_.Name -eq $svcName } | Select-Object -First 1
                     if (-not $svcObj) { continue }
                     $svcNodeId = New-PHId "service" $svcName
@@ -2046,43 +2049,40 @@ function Check-PrintSpooler {
         if (-not $spoolerSvc -or $spoolerSvc.Status -ne "Running") {
             Write-PHStatus "Print Spooler not running" "info"; return
         }
-        $vulnerable = $false; $reasons = @()
+        $reasons = @()
         # Check Point and Print NoWarningNoElevationOnInstall
         $ppRegPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint"
         try {
             $ppReg = Get-ItemProperty $ppRegPath -EA SilentlyContinue
             if ($ppReg -and $ppReg.NoWarningNoElevationOnInstall -eq 1) {
-                $vulnerable = $true; $reasons += "NoWarningNoElevationOnInstall=1"
+                $reasons += "NoWarningNoElevationOnInstall=1"
             }
         } catch {}
-        # Check RestrictDriverInstallationToAdministrators
+        # Only an explicit 0 proves disabled driver-install restrictions; an absent value does not.
+        # Missing historical KB IDs do not prove a machine is unpatched; cumulative updates supersede them.
         $restrictRegPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers"
         try {
             $restrictReg = Get-ItemProperty $restrictRegPath -EA SilentlyContinue
-            if (-not $restrictReg -or $null -eq $restrictReg.RestrictDriverInstallationToAdministrators -or $restrictReg.RestrictDriverInstallationToAdministrators -eq 0) {
-                $vulnerable = $true; $reasons += "RestrictDriverInstallationToAdministrators=0/absent"
+            if ($restrictReg -and $restrictReg.RestrictDriverInstallationToAdministrators -eq 0) {
+                $reasons += "RestrictDriverInstallationToAdministrators=0"
             }
-        } catch { $vulnerable = $true; $reasons += "RestrictDriverInstallationToAdministrators=absent" }
-        # Check for CVE-2021-34527 patch
-        $patched = $false
-        try { $patched = (Get-HotFix -EA SilentlyContinue | Where-Object { $_.HotFixID -match "KB5005010|KB5005565|KB5005566|KB5005568|KB5005033" }).Count -gt 0 } catch {}
-        if (-not $patched) { $reasons += "PrintNightmare patch (KB5005010) not found" }
-        if ($vulnerable -or -not $patched) {
-            $nid = New-PHId "printspooler" "Spooler"
-            Add-PHNode $nid @("PHPrintSpooler") @{
-                name     = "PRINTSPOOLER@$Script:HOSTNAME"
-                hostname = $Script:HOSTNAME
-                state    = $spoolerSvc.Status.ToString()
-                reasons  = ($reasons -join "; ")
-                patched  = $patched
-            }
-            Add-PHEdge $Script:CurrentUserId $nid "PHCanExploitSpooler" @{mitre="T1068";reasons=($reasons -join "; ")}
-            Add-PHEdge $nid $Script:SystemNodeId "PHEscalatesTo"
-            Add-PHFinding "PrintSpooler" "CRITICAL" "Print Spooler vulnerable: $($reasons -join ', ')" "Use PrintNightmare PoC or malicious print server"
-            Write-PHStatus "Print Spooler vulnerable!" "finding"
-        } else {
-            Write-PHStatus "Print Spooler running but appears patched" "info"
+        } catch {}
+        $weakPolicy = $reasons.Count -gt 0
+        if (-not $weakPolicy) {
+            Write-PHStatus "Print Spooler running; no explicitly weakened policy found" "info"
+            return
         }
+        $nid = New-PHId "printspooler" "Spooler"
+        Add-PHNode $nid @("PHPrintSpooler") @{
+            name     = "PRINTSPOOLER@$Script:HOSTNAME"
+            hostname = $Script:HOSTNAME
+            state    = $spoolerSvc.Status.ToString()
+            reasons  = ($reasons -join "; ")
+            weak_policy_observed = $weakPolicy
+        }
+        Add-PHEdge $Script:CurrentUserId $nid "PHObservedSpoolerPolicy" @{weak_policy_observed=$weakPolicy}
+        Add-PHFinding "PrintSpooler" "MEDIUM" "Print Spooler policy permits less-restricted driver installation: $($reasons -join ', ') (verify patch and exploitability)" "Review Point and Print policy and installed cumulative updates"
+        Write-PHStatus "Print Spooler policy requires review" "finding"
     } catch { Write-PHStatus "Error checking Print Spooler: $_" "error" }
 }
 
@@ -2115,9 +2115,9 @@ function Check-WSUSConfig {
     } catch { Write-PHStatus "Error checking WSUS: $_" "error" }
 }
 
-# ── CHECK 21: SCCM/MECM NAA CREDENTIALS ──
+# ── CHECK 21: SCCM/MECM CREDENTIAL SOURCES ──
 function Check-SCCMCredentials {
-    Write-PHStatus "Checking for SCCM/MECM NAA credentials..."
+    Write-PHStatus "Checking for SCCM/MECM credential sources..."
     $found = $false
     # Check if SCCM client is installed
     $sccmInstalled = $false
@@ -2139,10 +2139,9 @@ function Check-SCCMCredentials {
                 description = "SCCM Network Access Account (DPAPI-protected)"
             }
             Add-PHEdge $Script:CurrentUserId $nid "PHCanReadNAA" @{mitre="T1552.001";source="WMI CCM_NetworkAccessAccount"}
-            Add-PHEdge $nid $nid "PHContainsCreds" @{source="SCCM_NAA"}
-            Add-PHFinding "SCCM" "CRITICAL" "SCCM NAA credentials found in WMI - decrypt with SharpSCCM" "SharpSCCM local secrets -m wmi"
+            Add-PHFinding "SCCM" "MEDIUM" "SCCM NAA policy found in WMI; credential presence and decryption unverified" "Inspect the NAA policy and validate access before attempting decryption"
             $found = $true
-            Write-PHStatus "SCCM NAA credentials found!" "finding"
+            Write-PHStatus "SCCM NAA policy found (credentials unverified)" "finding"
         }
     } catch {}
 
@@ -2158,20 +2157,19 @@ function Check-SCCMCredentials {
                 description = "SCCM Task Sequence (may contain embedded credentials)"
             }
             Add-PHEdge $Script:CurrentUserId $tsNid "PHCanReadNAA" @{mitre="T1552.001";source="CCM_TaskSequence"}
-            Add-PHEdge $tsNid $tsNid "PHContainsCreds" @{source="SCCM_TaskSequence"}
-            Add-PHFinding "SCCM" "HIGH" "SCCM Task Sequences found - may contain embedded creds" "SharpSCCM local secrets"
+            Add-PHFinding "SCCM" "MEDIUM" "SCCM Task Sequences found; embedded credentials unverified" "Review task sequence policy for sensitive data"
             $found = $true
         }
     } catch {}
 
-    if (-not $found) { Write-PHStatus "SCCM client installed but no NAA/TaskSequence creds accessible" "info" }
+    if (-not $found) { Write-PHStatus "SCCM client installed but no NAA/task-sequence policies found" "info" }
 }
 
 # ── CHECK 22: COM OBJECT HIJACKING ──
 function Check-COMHijacking {
-    Write-PHStatus "Checking COM object hijacking opportunities..."
+    Write-PHStatus "Checking COM override candidates..."
     $count = 0
-    # Known hijackable CLSIDs that run in SYSTEM context
+    # CLSIDs worth reviewing if privileged activation through HKCU can be shown
     $hijackableCLSIDs = @(
         @{CLSID="{0f87369f-a4e5-4cfc-bd3e-73e6154572dd}"; Desc="Scheduled Task Handler"},
         @{CLSID="{4590F811-1D3A-11D0-891F-00AA004B2E24}"; Desc="WBEM Locator"},
@@ -2182,14 +2180,15 @@ function Check-COMHijacking {
     )
     foreach ($entry in $hijackableCLSIDs) {
         $clsid = $entry.CLSID
-        # Check if HKCR has the CLSID (system-wide registration exists)
+        # A system-wide registration without an HKCU override is common on
+        # Windows. It is only a candidate: privileged activation is unverified.
         $hkcrPath = "Registry::HKEY_CLASSES_ROOT\CLSID\$clsid\InprocServer32"
         $hkcuPath = "HKCU:\Software\Classes\CLSID\$clsid"
         try {
             $hkcrExists = Test-Path $hkcrPath -EA SilentlyContinue
             $hkcuExists = Test-Path $hkcuPath -EA SilentlyContinue
             if ($hkcrExists -and -not $hkcuExists) {
-                # HKCR entry exists but HKCU override does not - hijackable
+                # Registration exists, but an elevated HKCU load is not proven.
                 $dllPath = (Get-ItemProperty $hkcrPath -EA SilentlyContinue).'(default)'
                 $nid = New-PHId "comhijack" $clsid
                 Add-PHNode $nid @("PHCOMHijack") @{
@@ -2197,23 +2196,24 @@ function Check-COMHijacking {
                     clsid    = $clsid
                     description = $entry.Desc
                     dll_path = $dllPath
+                    privileged_activation_verified = $false
                     hostname = $Script:HOSTNAME
                 }
-                Add-PHEdge $Script:CurrentUserId $nid "PHCanHijackCOM" @{mitre="T1546.015";clsid=$clsid}
-                Add-PHEdge $nid $Script:AdminNodeId "PHExecutesAs" @{technique="COM hijack to privileged context"}
-                Add-PHFinding "COMHijack" "MEDIUM" "Hijackable COM object: $($entry.Desc) ($clsid)" "Create HKCU\\Classes\\CLSID\\$clsid\\InprocServer32 with malicious DLL"
+                Add-PHEdge $Script:CurrentUserId $nid "PHCanOverrideCOM" @{mitre="T1546.015";clsid=$clsid}
+                Add-PHFinding "COMHijack" "MEDIUM" "COM per-user override candidate: $($entry.Desc) ($clsid); privileged activation unverified" "Verify a privileged process loads this CLSID through HKCU before treating it as an escalation path"
                 $count++
             }
         } catch {}
     }
-    Write-PHStatus "Found $count hijackable COM object(s)" $(if($count){"finding"}else{"info"})
+    Write-PHStatus "Found $count COM override candidate(s)" $(if($count){"finding"}else{"info"})
 }
 
 # ── CHECK 23: NAMED PIPE PERMISSIONS ──
 function Check-NamedPipePermissions {
     Write-PHStatus "Checking named pipe permissions..."
     $count = 0
-    # Known pipes associated with SYSTEM services that may allow impersonation
+    # These include normal Windows RPC pipes. Connectivity is an observation,
+    # not evidence that the server can be impersonated.
     $interestingPipes = @(
         @{Name="spoolss";Desc="Print Spooler";Service="Spooler"},
         @{Name="epmapper";Desc="RPC Endpoint Mapper";Service="RpcEptMapper"},
@@ -2226,17 +2226,16 @@ function Check-NamedPipePermissions {
     } catch { $pipes = @() }
 
     foreach ($ip in $interestingPipes) {
-        $pipeExists = $pipes | Where-Object { $_ -eq $ip.Name -or $_ -match "^$([regex]::Escape($ip.Name))$" }
+        $pipeExists = $pipes | Where-Object { $_ -eq $ip.Name }
         if (-not $pipeExists) { continue }
         # Test if we can connect to the pipe
         $canConnect = $false
+        $pipeClient = $null
         try {
             $pipeClient = [System.IO.Pipes.NamedPipeClientStream]::new(".", $ip.Name, [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::None)
             $pipeClient.Connect(500)
             $canConnect = $true
-            $pipeClient.Close()
-            $pipeClient.Dispose()
-        } catch { }
+        } catch { } finally { if ($pipeClient) { $pipeClient.Dispose() } }
         if ($canConnect) {
             $nid = New-PHId "namedpipe" $ip.Name
             Add-PHNode $nid @("PHNamedPipe") @{
@@ -2246,13 +2245,12 @@ function Check-NamedPipePermissions {
                 service  = $ip.Service
                 hostname = $Script:HOSTNAME
             }
-            Add-PHEdge $Script:CurrentUserId $nid "PHCanImpersonatePipe" @{mitre="T1134.001";pipe=$ip.Name}
-            Add-PHEdge $nid $Script:SystemNodeId "PHRunsAs" @{run_account="SYSTEM";service=$ip.Service}
-            Add-PHFinding "NamedPipe" "MEDIUM" "Connectable SYSTEM pipe: \\.\pipe\$($ip.Name) ($($ip.Desc))" "Use token impersonation (PrintSpoofer/EfsPotato)"
+            Add-PHEdge $Script:CurrentUserId $nid "PHCanConnectPipe" @{pipe=$ip.Name}
+            Add-PHFinding "NamedPipe" "MEDIUM" "Accessible named pipe: \\.\pipe\$($ip.Name) ($($ip.Desc)); impersonation unverified" "Inspect pipe ACL, server identity and impersonation behavior"
             $count++
         }
     }
-    Write-PHStatus "Found $count accessible SYSTEM pipe(s)" $(if($count){"finding"}else{"info"})
+    Write-PHStatus "Found $count accessible named pipe candidate(s)" $(if($count){"finding"}else{"info"})
 }
 
 # ── CHECK 24: CACHED DOMAIN CREDENTIALS / CREDENTIAL FILES ──
@@ -2260,21 +2258,26 @@ function Check-CachedCredentials {
     Write-PHStatus "Checking cached credentials and credential stores..."
     $count = 0
 
-    # DCC2 cached logon count
+    # CachedLogonsCount limits cached logons; a positive value does not prove credentials exist.
+    # It can be set on workgroup hosts. This check does not inspect the protected cache.
     try {
+        $computer = Get-CimInstance Win32_ComputerSystem -EA SilentlyContinue
+        $domainJoined = if ($computer) { [bool]$computer.PartOfDomain } else { $null }
         $winlogonReg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -EA SilentlyContinue
         $cachedCount = $winlogonReg.CachedLogonsCount
         if ($null -ne $cachedCount -and [int]$cachedCount -gt 0) {
+            $domainState = if ($null -eq $domainJoined) { 'unknown' } elseif ($domainJoined) { 'yes' } else { 'no' }
             $nid = New-PHId "cachedcreds" "DCC2"
             Add-PHNode $nid @("PHCachedCreds") @{
-                name        = "CACHED:DCC2@$Script:HOSTNAME"
+                name        = "CACHED:DOMAINLOGONPOLICY@$Script:HOSTNAME"
                 hostname    = $Script:HOSTNAME
-                source      = "DCC2"
-                description = "Domain Cached Credentials (CachedLogonsCount=$cachedCount)"
+                source      = "CachedLogonsCount"
+                description = "Cached domain logon policy permits $cachedCount entries; actual cache contents unverified"
                 cached_count = [int]$cachedCount
+                domain_joined = $domainJoined
             }
-            Add-PHEdge $Script:CurrentUserId $nid "PHHasCachedCreds" @{mitre="T1552.001";cached_count=[int]$cachedCount}
-            Add-PHFinding "CachedCreds" "MEDIUM" "Domain cached credentials enabled (CachedLogonsCount=$cachedCount) - DCC2 hashes in SECURITY hive" "Extract with mimikatz lsadump::cache (requires SYSTEM)"
+            Add-PHEdge $Script:CurrentUserId $nid "PHCachedLogonsConfigured" @{cached_count=[int]$cachedCount}
+            Add-PHFinding "CachedCreds" "MEDIUM" "CachedLogonsCount=$cachedCount configured (domain joined: $domainState); cached credentials unverified" "Check whether domain logons were ever cached before investigating DCC2 hashes"
             $count++
         }
     } catch {}
@@ -2300,7 +2303,6 @@ function Check-CachedCredentials {
                     Add-PHEdge $Script:CurrentUserId $nid "PHHasCachedCreds" @{mitre="T1552.001";source="WinSCP"}
                     if ($sessProps.Password) {
                         Add-PHEdge $nid $nid "PHContainsCreds" @{source="WinSCP"}
-                        [void]$Script:ExtractedCreds.Add(@{ source="WinSCP"; username=$sessProps.UserName; password="[WinSCP-encrypted]"; nodeId=$nid })
                     }
                     Add-PHFinding "CachedCreds" "HIGH" "WinSCP stored session: $sessName ($($sessProps.HostName))" "Decrypt with WinSCP password recovery tools"
                     $count++
@@ -2319,8 +2321,8 @@ function Check-CachedCredentials {
                 foreach ($srv in $servers) {
                     $fzHost = $srv.Host
                     $fzUser = $srv.User
-                    $fzPass = $srv.Pass
-                    if ($fzPass) {
+                    $passNode = $srv.SelectSingleNode('Pass')
+                    if ($passNode -and $passNode.InnerText) {
                         $nid = New-PHId "cachedcreds" "FileZilla_$fzHost"
                         Add-PHNode $nid @("PHCachedCreds") @{
                             name     = "CACHED:FileZilla:$fzHost@$Script:HOSTNAME"
@@ -2331,12 +2333,19 @@ function Check-CachedCredentials {
                             username = $fzUser
                         }
                         Add-PHEdge $Script:CurrentUserId $nid "PHHasCachedCreds" @{mitre="T1552.001";source="FileZilla"}
-                        # FileZilla stores base64-encoded plaintext passwords
+                        Add-PHEdge $nid $nid "PHContainsCreds" @{source="FileZilla"}
+                        $encoding = $passNode.GetAttribute('encoding')
                         $decodedPass = $null
-                        try { $decodedPass = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($fzPass)) } catch { $decodedPass = $fzPass }
+                        if ($encoding -eq 'base64') {
+                            try {
+                                $decodedPass = [Text.Encoding]::UTF8.GetString(
+                                    [Convert]::FromBase64String($passNode.InnerText))
+                            } catch { Write-Verbose "Invalid FileZilla base64 password in $fzPath" }
+                        } elseif (-not $encoding) { $decodedPass = $passNode.InnerText }
                         if ($decodedPass) {
-                            Add-PHEdge $nid $nid "PHContainsCreds" @{source="FileZilla"}
-                            [void]$Script:ExtractedCreds.Add(@{ source="FileZilla"; username=$fzUser; password=$decodedPass; nodeId=$nid })
+                            [void]$Script:ExtractedCreds.Add(@{
+                                source="FileZilla"; username=$fzUser; password=$decodedPass; nodeId=$nid
+                            })
                         }
                         Add-PHFinding "CachedCreds" "HIGH" "FileZilla stored creds for $fzUser@$fzHost" "Read $fzPath"
                         $count++
@@ -2364,7 +2373,6 @@ function Check-CachedCredentials {
                     }
                     Add-PHEdge $Script:CurrentUserId $nid "PHHasCachedCreds" @{mitre="T1552.001";source="PuTTY"}
                     Add-PHEdge $nid $nid "PHContainsCreds" @{source="PuTTY"}
-                    [void]$Script:ExtractedCreds.Add(@{ source="PuTTY"; username=$sessProps.ProxyUsername; password=$sessProps.ProxyPassword; nodeId=$nid })
                     Add-PHFinding "CachedCreds" "HIGH" "PuTTY session '$sessName' has proxy password" "Read from registry"
                     $count++
                 }
@@ -2380,8 +2388,7 @@ function Check-CachedCredentials {
             try {
                 $profileDetail = netsh wlan show profile name="$pName" key=clear 2>$null
                 $keyMatch = [regex]::Match(($profileDetail -join "`n"), 'Key Content\s*:\s*(.+)')
-                if ($keyMatch.Success) {
-                    $wifiKey = $keyMatch.Groups[1].Value.Trim()
+                if ($keyMatch.Success -and $keyMatch.Groups[1].Value.Trim()) {
                     $nid = New-PHId "cachedcreds" "WiFi_$pName"
                     Add-PHNode $nid @("PHCachedCreds") @{
                         name     = "CACHED:WiFi:$pName@$Script:HOSTNAME"
@@ -2391,7 +2398,6 @@ function Check-CachedCredentials {
                     }
                     Add-PHEdge $Script:CurrentUserId $nid "PHHasCachedCreds" @{mitre="T1552.001";source="WiFi"}
                     Add-PHEdge $nid $nid "PHContainsCreds" @{source="WiFi"}
-                    [void]$Script:ExtractedCreds.Add(@{ source="WiFi"; username=$pName; password=$wifiKey; nodeId=$nid })
                     Add-PHFinding "CachedCreds" "LOW" "WiFi profile '$pName' key readable" "netsh wlan show profile name=$pName key=clear"
                     $count++
                 }
@@ -2503,7 +2509,7 @@ function Check-WebClientRelay {
         start_type   = $startType
         ldap_signing = $ldapSigning
     }
-    Add-PHEdge $nid $Script:SystemNodeId "PHEscalatesTo" @{method="NTLM relay to LDAP → Shadow Credentials/RBCD → S4U2Self → SYSTEM service"}
+    Add-PHEdge $nid $Script:SystemNodeId "PHEscalatesTo" @{method="NTLM relay to LDAP -> Shadow Credentials/RBCD -> S4U2Self -> SYSTEM service"}
     Add-PHFinding "WebClientRelay" $severity "$detail | LDAP signing: $ldapSigning | Domain: $($cs.Domain)" "Use WebClientRelayUp/DavRelayUp/KrbRelayUp"
     Write-PHStatus "WebClient relay: $severity ($detail, LDAP signing $ldapSigning)" $(if($severity -in @("CRITICAL","HIGH")){"finding"}else{"warn"})
 }
@@ -2667,13 +2673,8 @@ function Get-CustomNodeKinds {
 }
 
 function Export-CustomNodeIcons([string]$OutDir=".") {
-    $kinds = Get-CustomNodeKinds
     # Build POST /api/v2/custom-nodes payload: { custom_types: { NodeKind: { icon: {...} } } }
-    $customTypes = [ordered]@{}
-    foreach ($kind in $kinds.Keys) {
-        $customTypes[$kind] = $kinds[$kind]
-    }
-    $apiPayload = @{ custom_types = $customTypes }
+    $apiPayload = @{ custom_types = (Get-CustomNodeKinds) }
     $combinedFile = Join-Path $(Get-Item $OutDir).FullName "privhound_customnodes.json"
     $json = $apiPayload | ConvertTo-Json -Depth 5
     [System.IO.File]::WriteAllText($combinedFile, $json, [System.Text.UTF8Encoding]::new($false))
@@ -2681,6 +2682,21 @@ function Export-CustomNodeIcons([string]$OutDir=".") {
 }
 
 # ── OUTPUT ────────────────────────────
+function Export-FindingsReport([string]$Path) {
+    $report = @{
+        hostname = $Script:HOSTNAME
+        generated_at = (Get-Date -Format o)
+        findings = @($Script:Findings)
+    }
+    $resolvedPath = if ([System.IO.Path]::IsPathRooted($Path)) { $Path } else { Join-Path (Get-Location) $Path }
+    $graphPath = if ([System.IO.Path]::IsPathRooted($OutputPath)) { $OutputPath } else { Join-Path (Get-Location) $OutputPath }
+    if ([System.IO.Path]::GetFullPath($resolvedPath) -ieq [System.IO.Path]::GetFullPath($graphPath)) {
+        throw 'FindingsPath must differ from OutputPath so the graph JSON is not overwritten'
+    }
+    [System.IO.File]::WriteAllText($resolvedPath, ($report | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+    Write-Host "  Findings report: $resolvedPath" -ForegroundColor Green
+}
+
 function Export-OpenGraphJson([string]$Path) {
     $payload = @{ metadata=@{source_kind=""}; graph=@{nodes=$Script:Nodes;edges=$Script:Edges} }
     $json = $payload | ConvertTo-Json -Depth 10
@@ -2688,19 +2704,22 @@ function Export-OpenGraphJson([string]$Path) {
     $resolvedPath = if ([System.IO.Path]::IsPathRooted($Path)) { $Path } else { Join-Path (Get-Location) $Path }
     [System.IO.File]::WriteAllText($resolvedPath, $json, [System.Text.UTF8Encoding]::new($false))
     Write-Host "`n  === COLLECTION COMPLETE ===" -ForegroundColor Green
-    Write-PHStatus "Nodes: $($Script:Nodes.Count) | Edges: $($Script:Edges.Count) | Findings: $($Script:Findings.Count)" "info"
+    Write-Host "  [i] Nodes: $($Script:Nodes.Count) | Edges: $($Script:Edges.Count) | Findings: $($Script:Findings.Count)" -ForegroundColor Cyan
+    Write-Host "  [i] Checks: $Script:CompletedCheckCount completed, $Script:FailedCheckCount failed, $Script:SkippedCheckCount skipped; $Script:EmptyCheckCount completed checks produced no findings (per-check details: -Verbose)" -ForegroundColor Cyan
     if ($Script:Findings.Count -gt 0) {
-        $sevColors = @{ CRITICAL = "Red"; HIGH = "Red"; MEDIUM = "Yellow" }
-        foreach ($sev in @("CRITICAL","HIGH","MEDIUM")) {
+        $sevColors = @{ CRITICAL = "Red"; HIGH = "Red"; MEDIUM = "Yellow"; LOW = "Cyan" }
+        $severities = @('CRITICAL','HIGH','MEDIUM','LOW') + @($Script:Findings | ForEach-Object { $_.Severity } | Sort-Object -Unique | Where-Object { $_ -notin @('CRITICAL','HIGH','MEDIUM','LOW') })
+        foreach ($sev in $severities) {
             $group = $Script:Findings | Where-Object { $_.Severity -eq $sev }
             foreach ($f in $group) {
-                Write-Host "  [$sev] $($f.Description)" -ForegroundColor $sevColors[$sev]
+                $color = if ($sevColors.ContainsKey($sev)) { $sevColors[$sev] } else { 'White' }
+                Write-Host "  [$sev] $($f.Description)" -ForegroundColor $color
             }
         }
     }
     Write-Host "`n  Output: $resolvedPath" -ForegroundColor Green
     Write-Host "  Upload: Administration -> File Ingest" -ForegroundColor Cyan
-    Write-Host "  Icons:  POST privhound_customnodes.json to /api/v2/custom-nodes" -ForegroundColor Cyan
+    Write-Host "  Icons:  Sync privhound_customnodes.json with bh\bh_upload.py --register-node" -ForegroundColor Cyan
     Write-Host "  Query:  Explore -> Cypher tab (pathfinding UI not supported for custom nodes yet)`n" -ForegroundColor Yellow
 }
 
@@ -2709,9 +2728,14 @@ function Invoke-PrivHound {
     Write-PHBanner
     if ($OutputFormat -in @("BloodHound-customnodes","All")) {
         $ip = Export-CustomNodeIcons
-        Write-PHStatus "Custom icons -> $ip (POST to /api/v2/custom-nodes)" "finding"
+        Write-PHStatus "Custom icons -> $ip (sync with bh\bh_upload.py --register-node)" "finding"
     }
     if ($OutputFormat -eq "BloodHound-customnodes") { return }
+
+    $uiCulture = Get-UICulture
+    if ($uiCulture.TwoLetterISOLanguageName -ne 'en') {
+        Write-PHStatus "Windows UI language is $($uiCulture.Name); checks parsing cmdkey/netsh/sc output require English and may miss findings" "warn"
+    }
 
     Initialize-CoreNodes
     $checks = @(
@@ -2724,6 +2748,7 @@ function Invoke-PrivHound {
         @{N="SensitiveFiles";F={Check-SensitiveFiles}},@{N="UACBypass";F={Check-UACBypass}},
         @{N="WritableProgDirs";F={Check-WritableProgramDirs}},
         @{N="CrossUserProfiles";F={Check-CrossUserProfiles}},
+        @{N="CachedCreds";F={Check-CachedCredentials}},
         @{N="CredLoginPaths";F={Check-CredentialLoginPaths}},
         @{N="CrossUserPriv";F={Check-CrossUserPrivileges}},
         @{N="JITAdmin";F={Check-JITAdminTools}},
@@ -2732,17 +2757,48 @@ function Invoke-PrivHound {
         @{N="SCCMCreds";F={Check-SCCMCredentials}},
         @{N="COMHijacking";F={Check-COMHijacking}},
         @{N="NamedPipes";F={Check-NamedPipePermissions}},
-        @{N="CachedCreds";F={Check-CachedCredentials}},
         @{N="WMISubscriptions";F={Check-WMISubscriptions}},
         @{N="WebClientRelay";F={Check-WebClientRelay}},
         @{N="SvcRecovery";F={Check-ServiceRecoveryActions}},
         @{N="ShadowCopies";F={Check-ShadowCopyFiles}}
     )
-    foreach ($c in $checks) {
-        if ($SkipChecks -contains $c.N) { Write-PHStatus "Skipping $($c.N)" "warn"; continue }
-        try { & $c.F } catch { Write-PHStatus "Error in $($c.N): $_" "error" }
+    $activeChecks = @($checks | Where-Object { $SkipChecks -notcontains $_.N }).Count
+    Write-Host "  [i] Checking $activeChecks of $($checks.Count) privilege escalation checks..." -ForegroundColor Cyan
+    $Script:CompletedCheckCount = 0
+    $Script:EmptyCheckCount = 0
+    $Script:FailedCheckCount = 0
+    $Script:SkippedCheckCount = $checks.Count - $activeChecks
+    $attempted = 0
+    try {
+        foreach ($c in $checks) {
+            if ($SkipChecks -contains $c.N) { Write-PHStatus "Skipping $($c.N)" "warn"; continue }
+            $attempted++
+            $progressStatus = 'Checking {0}/{1}: {2}' -f $attempted, $activeChecks, $c.N
+            Write-Progress -Activity 'PrivHound collection' -Status $progressStatus -PercentComplete ([int](100 * $attempted / $activeChecks))
+            $before = $Script:Findings.Count
+            try {
+                & $c.F
+                $Script:CompletedCheckCount++
+                if ($Script:Findings.Count -eq $before) { $Script:EmptyCheckCount++ }
+            } catch {
+                $Script:FailedCheckCount++
+                Write-PHStatus "Error in $($c.N): $_" "error"
+            }
+        }
+    } finally {
+        Write-Progress -Activity 'PrivHound collection' -Completed
     }
     Export-OpenGraphJson $OutputPath
+    if ($FindingsPath) {
+        try { Export-FindingsReport $FindingsPath }
+        catch { Write-PHStatus "Could not write findings report: $_" "error" }
+    }
 }
 
-Invoke-PrivHound
+try { Invoke-PrivHound }
+finally {
+    if ($null -ne $Script:AclIdentity) {
+        $Script:AclIdentity.Dispose()
+        $Script:AclIdentity = $null
+    }
+}

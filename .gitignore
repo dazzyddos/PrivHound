@@ -1,5 +1,7 @@
-# PrivHound scan output (not the custom nodes definition)
+# Generated PrivHound collection and icon files
 privhound_*_*.json
+privhound_findings*.json
+privhound_customnodes.json
 
 # Claude Code
 .claude/
@@ -10,3 +12,7 @@ Desktop.ini
 
 # PowerShell
 *.ps1xml
+
+.venv/
+.env
+__pycache__/
